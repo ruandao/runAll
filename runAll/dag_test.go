@@ -109,6 +109,19 @@ func TestBuildDAG_SelfReference(t *testing.T) {
 	}
 }
 
+func TestBuildDAG_MissingDependency(t *testing.T) {
+	services := []Service{
+		makeService("a", "nonexistent"),
+	}
+	_, err := BuildDAG(services)
+	if err == nil {
+		t.Fatal("expected error for missing dependency")
+	}
+	if !strings.Contains(err.Error(), "unknown service") {
+		t.Fatalf("error should mention unknown service, got: %v", err)
+	}
+}
+
 func TestBuildDAG_EmptyList(t *testing.T) {
 	levels, err := BuildDAG([]Service{})
 	if err != nil {

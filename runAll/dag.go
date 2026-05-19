@@ -29,7 +29,10 @@ func BuildDAG(services []Service) ([]ExecutionLevel, error) {
 	// Compute dependents and indegrees
 	for _, node := range nodes {
 		for _, depName := range node.DependsOn {
-			dep := nodes[depName]
+			dep, ok := nodes[depName]
+			if !ok {
+				return nil, fmt.Errorf("service %q depends on unknown service %q", node.Service.Name, depName)
+			}
 			dep.Dependents = append(dep.Dependents, node.Service.Name)
 		}
 		node.InDegree = len(node.DependsOn)
