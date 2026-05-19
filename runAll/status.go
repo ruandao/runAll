@@ -14,6 +14,7 @@ const (
 	StatusHealthy  Status = "healthy"
 	StatusFailed   Status = "failed"
 	StatusSkipped  Status = "skipped"
+	StatusRestarting Status = "restarting"
 )
 
 type ServiceStatus struct {

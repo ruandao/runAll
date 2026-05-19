@@ -248,6 +248,75 @@ func (r *Runner) Shutdown() {
 	}
 }
 
+func (r *Runner) RestartService(ctx context.Context, name string) error {
+	svc := r.findService(name)
+	if svc == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+
+	current := r.store.Get(name)
+	if current == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	if current.Status != StatusHealthy && current.Status != StatusFailed {
+		return fmt.Errorf("service %q is %s, can only restart healthy or failed services", name, current.Status)
+	}
+
+	r.store.Update(name, StatusRestarting, "")
+
+	// Stop existing process
+	r.stopProcess(name)
+
+	// Start and health check
+	node := &ServiceNode{Service: *svc}
+	if err := r.startAndCheck(ctx, node); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *Runner) findService(name string) *Service {
+	for _, g := range r.cfg.Groups {
+		for _, svc := range g.Services {
+			if svc.Name == name {
+				return &svc
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) stopProcess(name string) {
+	r.mu.Lock()
+	cmd, ok := r.processes[name]
+	if ok {
+		delete(r.processes, name)
+	}
+	r.mu.Unlock()
+
+	if !ok || cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	log.Printf("[%s] restarting: sending SIGTERM", name)
+	syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+
+	done := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[%s] stopped for restart", name)
+	case <-time.After(5 * time.Second):
+		log.Printf("[%s] did not stop, sending SIGKILL", name)
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		cmd.Wait()
+	}
+}
+
 func streamOutput(r io.Reader, name string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {

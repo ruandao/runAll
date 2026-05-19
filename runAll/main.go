@@ -31,7 +31,7 @@ func main() {
 
 	// Start Web UI (only in foreground mode)
 	if !*daemon {
-		srv := startUIServer(store, *uiPort)
+		srv := startUIServer(store, runner, *uiPort)
 		log.Printf("Web UI: http://localhost%s", *uiPort)
 		defer srv.Close()
 	}

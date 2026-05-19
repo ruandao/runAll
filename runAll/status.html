@@ -21,6 +21,8 @@
   .dot.gray { background: #6b7280; }
   .dot.red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
   .dot.dark { background: #374151; }
+  .restart-btn { background: none; border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 16px; padding: 2px 8px; border-radius: 4px; line-height: 1; }
+  .restart-btn:hover { background: #333; color: #fff; border-color: #888; }
   .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
   .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
   .uptime { font-size: 12px; color: #888; margin-top: 20px; }
@@ -34,7 +36,7 @@
 <script>
 const startTime = Date.now();
 const dotClass = {
-  healthy: 'green', starting: 'yellow', retrying: 'yellow',
+  healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
   pending: 'gray', failed: 'red', skipped: 'dark'
 };
 
@@ -61,6 +63,9 @@ async function refresh() {
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
       html += `<span class="status">${svc.status}</span>`;
+	      if (svc.status === 'healthy' || svc.status === 'failed') {
+	        html += `<button class="restart-btn" onclick="restartService('${esc(svc.name)}')" title="Restart">&#x21bb;</button>`;
+	      }
       if (svc.depends_on && svc.depends_on.length > 0) {
         html += `<span class="deps">`;
         for (const dep of svc.depends_on) {
@@ -83,6 +88,22 @@ async function refresh() {
     // Keep showing last successful state; update uptime only
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     document.getElementById('uptime').textContent = `Uptime: ${elapsed}s (fetch error)`;
+  }
+}
+
+async function restartService(name) {
+  try {
+    const resp = await fetch('/api/restart', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const result = await resp.json();
+    if (!resp.ok) {
+      alert('Restart failed: ' + (result.error || 'unknown error'));
+    }
+  } catch (err) {
+    alert('Restart failed: ' + err.message);
   }
 }
 

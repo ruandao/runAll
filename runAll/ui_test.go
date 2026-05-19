@@ -15,7 +15,7 @@ func TestAPIStatus(t *testing.T) {
 	store.Update("kafka", StatusStarting, "")
 
 	mux := http.NewServeMux()
-	registerUIHandlers(mux, store)
+	registerUIHandlers(mux, store, nil)
 
 	req := httptest.NewRequest("GET", "/api/status", nil)
 	rec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func TestUIHomePage(t *testing.T) {
 	store.Init([]string{"svc"})
 
 	mux := http.NewServeMux()
-	registerUIHandlers(mux, store)
+	registerUIHandlers(mux, store, nil)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
