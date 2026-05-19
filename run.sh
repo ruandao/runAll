@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "==> Building runAll..."
-go build -o runAll .
+./build.sh
 
 echo "==> Starting runAll..."
-exec ./runAll --config ../config.yaml "$@"
+exec ./bin/runAll --config ../config.yaml "$@"

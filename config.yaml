@@ -1,5 +1,5 @@
 # runAll 编排配置 — 与 task2app/conf/port_config.json 端口一致
-# 用法（在 runAll 目录）: ./runAll --config ./config.yaml
+# 用法（在 runAll 目录）: ./bin/runAll --config ./config.yaml
 # 前置: Docker Desktop（基础设施）、task2app 虚拟环境、各前端 npm install、go 工具链
 
 version: "1"

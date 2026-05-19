@@ -145,7 +145,12 @@ func (s *StatusStore) UpdateDependencyStatus(name string, status Status) {
 func (s *StatusStore) Get(name string) *ServiceStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.services[name]
+	svc, ok := s.services[name]
+	if !ok {
+		return nil
+	}
+	cp := *svc
+	return &cp
 }
 
 func (s *StatusStore) All() []*ServiceStatus {

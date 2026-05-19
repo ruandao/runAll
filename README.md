@@ -2,27 +2,52 @@
 
 Multi-service orchestrator that reads a YAML config, starts services in correct DAG order, health-checks them, and serves a Web UI dashboard.
 
+## 目录结构
+
+```text
+runAll/
+├── src/           # Go 源码与 embed 的 status.html
+├── bin/           # 编译产物（git 忽略）
+├── config.yaml    # 示例编排配置
+├── build.sh       # 编译脚本
+├── test.sh        # 单元测试
+├── go.mod
+└── README.md
+```
+
 ## Build
 
 ```bash
 cd runAll
-go build -o runAll .
+./build.sh
 ```
 
-Requires Go 1.24+.
+产物：`bin/runAll`。Requires Go 1.24+.
 
 ## Usage
 
 ```bash
 # Foreground mode with Web UI on :9999
-./runAll --config ./config.yaml
+./bin/runAll --config ./config.yaml
 
 # Start and exit (no Web UI)
-./runAll --config ./config.yaml --daemon
+./bin/runAll --config ./config.yaml --daemon
 
 # Custom UI port
-./runAll --config ./config.yaml --ui-port :8080
+./bin/runAll --config ./config.yaml --ui-port :8080
+
+# Build + start with repo-root config (from runAll/)
+./run.sh
 ```
+
+## Tests
+
+```bash
+cd runAll
+./test.sh
+```
+
+`build_test.go` 会调用 `build.sh` 并断言 `bin/runAll` 已生成。
 
 | Flag | Default | Description |
 |------|---------|-------------|
