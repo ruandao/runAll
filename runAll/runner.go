@@ -79,8 +79,13 @@ func (r *Runner) Run(ctx context.Context, daemon bool) error {
 }
 
 func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
+	levelCtx, levelCancel := context.WithCancel(ctx)
+	defer levelCancel()
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(level.Services))
+	exitFailed := make(chan struct{})
+	var exitOnce sync.Once
 
 	for _, node := range level.Services {
 		// Check if any dependency was skipped/failed
@@ -101,8 +106,14 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 		wg.Add(1)
 		go func(node *ServiceNode) {
 			defer wg.Done()
-			if err := r.startAndCheck(ctx, node); err != nil {
+			select {
+			case <-exitFailed:
+				return
+			default:
+			}
+			if err := r.startAndCheck(levelCtx, node); err != nil {
 				errCh <- err
+				exitOnce.Do(func() { close(exitFailed); levelCancel() })
 			}
 		}(node)
 	}
@@ -111,17 +122,17 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 	close(errCh)
 
 	// Collect errors
-	var firstExitErr error
+	var firstErr error
 	for err := range errCh {
-		if firstExitErr == nil && err != nil {
-			firstExitErr = err
+		if firstErr == nil {
+			firstErr = err
 		}
 	}
 
 	// If any exit-type failure occurred, stop everything
-	if firstExitErr != nil {
+	if firstErr != nil {
 		r.Shutdown()
-		return firstExitErr
+		return firstErr
 	}
 
 	return nil
@@ -145,8 +156,24 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 		cmd.Env = env
 	}
 
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		r.store.Update(svc.Name, StatusFailed, err.Error())
+		if svc.OnFailure == "exit" {
+			return fmt.Errorf("[%s] stdout pipe: %w", svc.Name, err)
+		}
+		log.Printf("[%s] stdout pipe error, skipping: %v", svc.Name, err)
+		return nil
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		r.store.Update(svc.Name, StatusFailed, err.Error())
+		if svc.OnFailure == "exit" {
+			return fmt.Errorf("[%s] stderr pipe: %w", svc.Name, err)
+		}
+		log.Printf("[%s] stderr pipe error, skipping: %v", svc.Name, err)
+		return nil
+	}
 
 	if err := cmd.Start(); err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
@@ -167,7 +194,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	// Health check
 	r.store.Update(svc.Name, StatusRetrying, "")
-	err := waitHealthy(ctx, svc.HealthCheck)
+	err = waitHealthy(ctx, svc.HealthCheck)
 	if err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
 		log.Printf("[%s] health check failed: %v", svc.Name, err)
@@ -225,5 +252,8 @@ func streamOutput(r io.Reader, name string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		log.Printf("[%s] %s", name, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[%s] output read error: %v", name, err)
 	}
 }
