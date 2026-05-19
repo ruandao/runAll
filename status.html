@@ -55,7 +55,8 @@ async function refresh() {
     byLevel.get(depth).push(svc);
   }
 
-  for (const [depth, services] of byLevel) {
+  const sortedLevels = [...byLevel.entries()].sort((a, b) => a[0] - b[0]);
+  for (const [depth, services] of sortedLevels) {
     html += `<div class="level-header">Level ${depth}</div>`;
     for (const svc of services) {
       const cls = dotClass[svc.status] || 'gray';

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -128,5 +129,8 @@ func (s *StatusStore) All() []*ServiceStatus {
 	for _, svc := range s.services {
 		result = append(result, svc)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
 	return result
 }

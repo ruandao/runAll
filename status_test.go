@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"strings"
 )
 
 func TestStatusStore_UpdateAndGet(t *testing.T) {
@@ -81,5 +82,37 @@ func TestStatusStore_SetDependsOn(t *testing.T) {
 	}
 	if got.DependsOn[0].Name != "backend" || got.DependsOn[0].Status != StatusHealthy {
 		t.Errorf("depends_on[0] = %+v, want {backend healthy}", got.DependsOn[0])
+	}
+}
+
+func TestStatusStore_AllReturnsSortedOrder(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"z", "a", "m"})
+
+	// Call All() multiple times — each result must be sorted by name
+	for i := 0; i < 10; i++ {
+		all := store.All()
+		if len(all) != 3 {
+			t.Fatalf("len = %d, want 3", len(all))
+		}
+		if all[0].Name != "a" || all[1].Name != "m" || all[2].Name != "z" {
+			t.Fatalf("iteration %d: order = %v, want [a m z]", i, []string{all[0].Name, all[1].Name, all[2].Name})
+		}
+	}
+}
+
+func TestStatusStore_AllSortedByName(t *testing.T) {
+	store := NewStatusStore()
+	names := []string{"frontend", "backend", "redis", "kafka", "db"}
+	store.Init(names)
+
+	all := store.All()
+	if len(all) != 5 {
+		t.Fatalf("len = %d, want 5", len(all))
+	}
+	for i := 1; i < len(all); i++ {
+		if strings.Compare(all[i-1].Name, all[i].Name) > 0 {
+			t.Errorf("not sorted: %q before %q", all[i-1].Name, all[i].Name)
+		}
 	}
 }
