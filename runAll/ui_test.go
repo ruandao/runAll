@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -48,7 +49,7 @@ func TestUIHomePage(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	contentType := rec.Header().Get("Content-Type")
-	if contentType == "" || (contentType != "" && contentType[:9] != "text/html") {
+	if !strings.HasPrefix(contentType, "text/html") {
 		t.Errorf("Content-Type = %q, want text/html", contentType)
 	}
 }

@@ -39,14 +39,13 @@ const dotClass = {
 };
 
 async function refresh() {
-  const resp = await fetch('/api/status');
-  const data = await resp.json();
-  const container = document.getElementById('services');
-  let html = '';
-  let level = -1;
-  let seenNewLevel = false;
-
-  // Group by DAG level (approximate by depends_on depth)
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const container = document.getElementById('services');
+    let html = '';
+    // Group by DAG level (approximate by depends_on depth)
   const byLevel = new Map();
   for (const svc of data) {
     const depth = svc.depends_on ? svc.depends_on.length : 0;
@@ -78,8 +77,13 @@ async function refresh() {
   }
   container.innerHTML = html;
 
-  const elapsed = Math.floor((Date.now() - startTime) / 1000);
-  document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
+  } catch (err) {
+    // Keep showing last successful state; update uptime only
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('uptime').textContent = `Uptime: ${elapsed}s (fetch error)`;
+  }
 }
 
 function esc(s) {
