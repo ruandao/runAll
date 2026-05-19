@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>runAll Status</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+  h1 { font-size: 18px; margin-bottom: 4px; color: #e0e0e0; }
+  .subtitle { font-size: 12px; color: #888; margin-bottom: 20px; }
+  .service { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 4px; background: #16213e; border-radius: 6px; }
+  .service:hover { background: #1c2a4a; }
+  .name { font-weight: 600; min-width: 140px; }
+  .status { font-size: 13px; min-width: 80px; }
+  .deps { display: flex; gap: 8px; flex-wrap: wrap; }
+  .dep { display: flex; align-items: center; gap: 4px; font-size: 12px; background: #0f3460; padding: 2px 8px; border-radius: 10px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .dot.green { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+  .dot.yellow { background: #facc15; box-shadow: 0 0 6px #facc15; }
+  .dot.gray { background: #6b7280; }
+  .dot.red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  .dot.dark { background: #374151; }
+  .restart-btn { background: none; border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 16px; padding: 2px 8px; border-radius: 4px; line-height: 1; }
+  .restart-btn:hover { background: #333; color: #fff; border-color: #888; }
+  .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
+  .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
+  .uptime { font-size: 12px; color: #888; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>runAll Status</h1>
+<div class="subtitle">auto-refresh every 2s</div>
+<div id="services"></div>
+<div class="uptime" id="uptime"></div>
+<script>
+const startTime = Date.now();
+const dotClass = {
+  healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
+  pending: 'gray', failed: 'red', skipped: 'dark'
+};
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const container = document.getElementById('services');
+    let html = '';
+    // Group by DAG level (approximate by depends_on depth)
+  const byLevel = new Map();
+  for (const svc of data) {
+    const depth = svc.depends_on ? svc.depends_on.length : 0;
+    if (!byLevel.has(depth)) byLevel.set(depth, []);
+    byLevel.get(depth).push(svc);
+  }
+
+  for (const [depth, services] of byLevel) {
+    html += `<div class="level-header">Level ${depth}</div>`;
+    for (const svc of services) {
+      const cls = dotClass[svc.status] || 'gray';
+      html += `<div class="service">`;
+      html += `<span class="dot ${cls}"></span>`;
+      html += `<span class="name">${esc(svc.name)}</span>`;
+      html += `<span class="status">${svc.status}</span>`;
+	      if (svc.status === 'healthy' || svc.status === 'failed') {
+	        html += `<button class="restart-btn" onclick="restartService('${esc(svc.name)}')" title="Restart">&#x21bb;</button>`;
+	      }
+      if (svc.depends_on && svc.depends_on.length > 0) {
+        html += `<span class="deps">`;
+        for (const dep of svc.depends_on) {
+          const dcls = dotClass[dep.status] || 'gray';
+          html += `<span class="dep"><span class="dot ${dcls}"></span>${esc(dep.name)}</span>`;
+        }
+        html += `</span>`;
+      }
+      if (svc.error) {
+        html += `<span class="error-msg">${esc(svc.error)}</span>`;
+      }
+      html += `</div>`;
+    }
+  }
+  container.innerHTML = html;
+
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
+  } catch (err) {
+    // Keep showing last successful state; update uptime only
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    document.getElementById('uptime').textContent = `Uptime: ${elapsed}s (fetch error)`;
+  }
+}
+
+async function restartService(name) {
+  try {
+    const resp = await fetch('/api/restart', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const result = await resp.json();
+    if (!resp.ok) {
+      alert('Restart failed: ' + (result.error || 'unknown error'));
+    }
+  } catch (err) {
+    alert('Restart failed: ' + err.message);
+  }
+}
+
+function esc(s) {
+  const el = document.createElement('span');
+  el.textContent = s;
+  return el.innerHTML;
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
