@@ -1,0 +1,42 @@
+version: "1"
+groups:
+  - name: infrastructure
+    services:
+      - name: redis
+        command: "redis-server --port 6379"
+        health_check:
+          url: "http://localhost:6379"
+          timeout: 30
+          retries: 10
+          backoff:
+            initial: 1.0
+            max: 8.0
+            multiplier: 2.0
+        on_failure: exit
+
+      - name: kafka
+        command: "docker start kafka"
+        health_check:
+          url: "http://localhost:9092"
+
+  - name: apps
+    services:
+      - name: saas-backend
+        command: "python manage.py runserver 0.0.0.0:8000"
+        health_check:
+          url: "http://localhost:8000/api/health"
+        depends_on: [redis, kafka]
+        working_dir: ./task2app/Saas_project
+
+      - name: go-relay
+        command: "./go_relayToTrae"
+        health_check:
+          url: "http://localhost:9090/healthz"
+        depends_on: [kafka]
+
+      - name: frontend
+        command: "npm run dev"
+        health_check:
+          url: "http://localhost:5173"
+        depends_on: [saas-backend]
+        on_failure: skip
