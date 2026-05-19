@@ -16,6 +16,7 @@ const (
 	StatusFailed   Status = "failed"
 	StatusSkipped  Status = "skipped"
 	StatusRestarting Status = "restarting"
+	StatusBuilding  Status = "building"
 )
 
 type ServiceStatus struct {
@@ -26,6 +27,7 @@ type ServiceStatus struct {
 	URL       string      `json:"url"`
 	PID       int         `json:"pid"`
 	StartedAt string      `json:"started_at"`
+	LastChecked string      `json:"last_checked"`
 	Error     string      `json:"error,omitempty"`
 }
 
@@ -69,6 +71,8 @@ func (s *StatusStore) Update(name string, status Status, errMsg string) {
 	}
 	if errMsg != "" {
 		svc.Error = errMsg
+	} else if status == StatusHealthy {
+		svc.Error = ""
 	}
 }
 
@@ -102,6 +106,28 @@ func (s *StatusStore) SetURL(name, url string) {
 	if svc, ok := s.services[name]; ok {
 		svc.URL = url
 	}
+}
+
+func (s *StatusStore) SetLastChecked(name string, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if svc, ok := s.services[name]; ok {
+		svc.LastChecked = t.Format(time.RFC3339)
+	}
+}
+
+func (s *StatusStore) CompareAndSwapStatus(name string, old, new Status) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	svc, ok := s.services[name]
+	if !ok {
+		return false
+	}
+	if svc.Status != old {
+		return false
+	}
+	svc.Status = new
+	return true
 }
 
 func (s *StatusStore) UpdateDependencyStatus(name string, status Status) {

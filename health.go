@@ -45,3 +45,22 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 
 	return fmt.Errorf("health check failed after %d retries", cfg.Retries)
 }
+
+func checkHealth(ctx context.Context, url string) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return nil
+	}
+	return fmt.Errorf("unhealthy: HTTP %d", resp.StatusCode)
+}

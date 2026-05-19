@@ -19,9 +19,13 @@ type Runner struct {
 	levels    []ExecutionLevel
 	processes map[string]*exec.Cmd
 	mu        sync.Mutex
+	monitors  map[string]context.CancelFunc
+	monitorMu sync.Mutex
 }
 
 func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
+	cfg.fillDefaults()
+
 	services := cfg.Flatten()
 	names := make([]string, len(services))
 	for i, svc := range services {
@@ -54,6 +58,7 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 		store:     store,
 		levels:    levels,
 		processes: make(map[string]*exec.Cmd),
+		monitors:  make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -66,6 +71,15 @@ func (r *Runner) Run(ctx context.Context, daemon bool) error {
 
 	log.Println("All services healthy.")
 
+	// Start continuous health monitoring for all services.
+	services := r.cfg.Flatten()
+	for _, svc := range services {
+		s := r.store.Get(svc.Name)
+		if s != nil && s.Status == StatusHealthy {
+			r.startMonitoring(ctx, svc)
+		}
+	}
+
 	if daemon {
 		log.Println("Daemon mode: exiting.")
 		return nil
@@ -74,6 +88,7 @@ func (r *Runner) Run(ctx context.Context, daemon bool) error {
 	log.Println("Running. Press Ctrl+C to stop.")
 	<-ctx.Done()
 	log.Println("Shutting down...")
+	r.stopAllMonitors()
 	r.Shutdown()
 	return nil
 }
@@ -142,7 +157,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	svc := node.Service
 	r.store.Update(svc.Name, StatusStarting, "")
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", svc.Command)
+	cmd := exec.Command("sh", "-c", svc.Command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if svc.WorkingDir != "" {
@@ -211,6 +226,8 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 }
 
 func (r *Runner) Shutdown() {
+	r.stopAllMonitors()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -254,15 +271,25 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 		return fmt.Errorf("service %q not found", name)
 	}
 
-	current := r.store.Get(name)
-	if current == nil {
-		return fmt.Errorf("service %q not found", name)
-	}
-	if current.Status != StatusHealthy && current.Status != StatusFailed {
+	if !r.store.CompareAndSwapStatus(name, StatusHealthy, StatusRestarting) &&
+		!r.store.CompareAndSwapStatus(name, StatusFailed, StatusRestarting) {
+		current := r.store.Get(name)
+		if current == nil {
+			return fmt.Errorf("service %q not found", name)
+		}
 		return fmt.Errorf("service %q is %s, can only restart healthy or failed services", name, current.Status)
 	}
+	r.stopMonitoring(name)
 
-	r.store.Update(name, StatusRestarting, "")
+	// Build before stopping: a failed build leaves the old process running.
+	if svc.BuildCommand != "" {
+		r.store.Update(name, StatusBuilding, "")
+		log.Printf("[%s] building...", name)
+		if err := r.runBuild(ctx, svc); err != nil {
+			r.store.Update(name, StatusFailed, err.Error())
+			return err
+		}
+	}
 
 	// Stop existing process
 	r.stopProcess(name)
@@ -273,6 +300,8 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 		return err
 	}
 
+	// Resume continuous monitoring
+	r.startMonitoring(ctx, *svc)
 	return nil
 }
 
@@ -317,6 +346,45 @@ func (r *Runner) stopProcess(name string) {
 	}
 }
 
+func (r *Runner) runBuild(ctx context.Context, svc *Service) error {
+	cmd := exec.CommandContext(ctx, "sh", "-c", svc.BuildCommand)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if svc.WorkingDir != "" {
+		cmd.Dir = svc.WorkingDir
+	}
+	if len(svc.Env) > 0 {
+		env := os.Environ()
+		for k, v := range svc.Env {
+			env = append(env, k+"="+v)
+		}
+		cmd.Env = env
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("[%s] build stdout pipe: %w", svc.Name, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("[%s] build stderr pipe: %w", svc.Name, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("[%s] build failed to start: %w", svc.Name, err)
+	}
+
+	go streamOutput(stdout, svc.Name)
+	go streamOutput(stderr, svc.Name)
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("[%s] build failed: %w", svc.Name, err)
+	}
+
+	log.Printf("[%s] build succeeded", svc.Name)
+	return nil
+}
+
 func streamOutput(r io.Reader, name string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
@@ -324,5 +392,74 @@ func streamOutput(r io.Reader, name string) {
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("[%s] output read error: %v", name, err)
+	}
+}
+
+func (r *Runner) startMonitoring(ctx context.Context, svc Service) {
+	r.monitorMu.Lock()
+	if _, exists := r.monitors[svc.Name]; exists {
+		r.monitorMu.Unlock()
+		return
+	}
+	monCtx, cancel := context.WithCancel(ctx)
+	r.monitors[svc.Name] = cancel
+	r.monitorMu.Unlock()
+
+	interval := time.Duration(svc.HealthCheck.CheckInterval) * time.Second
+	go r.runMonitor(monCtx, svc, interval)
+}
+
+func (r *Runner) stopMonitoring(name string) {
+	r.monitorMu.Lock()
+	defer r.monitorMu.Unlock()
+	if cancel, ok := r.monitors[name]; ok {
+		cancel()
+		delete(r.monitors, name)
+	}
+}
+
+func (r *Runner) stopAllMonitors() {
+	r.monitorMu.Lock()
+	defer r.monitorMu.Unlock()
+	for name, cancel := range r.monitors {
+		cancel()
+		delete(r.monitors, name)
+	}
+}
+
+func (r *Runner) removeMonitor(name string) {
+	r.monitorMu.Lock()
+	defer r.monitorMu.Unlock()
+	delete(r.monitors, name)
+}
+
+func (r *Runner) runMonitor(ctx context.Context, svc Service, interval time.Duration) {
+	defer r.removeMonitor(svc.Name)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	consecutive := 0
+	threshold := svc.HealthCheck.UnhealthyThreshold
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := checkHealth(ctx, svc.HealthCheck.URL)
+			r.store.SetLastChecked(svc.Name, time.Now())
+			if err != nil {
+				consecutive++
+				log.Printf("[%s] health check failed (%d/%d): %v", svc.Name, consecutive, threshold, err)
+				if consecutive >= threshold {
+					r.store.Update(svc.Name, StatusFailed, err.Error())
+					log.Printf("[%s] marked failed after %d consecutive failures", svc.Name, consecutive)
+					return
+				}
+			} else {
+				consecutive = 0
+			}
+		}
 	}
 }

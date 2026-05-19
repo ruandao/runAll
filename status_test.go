@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 	"strings"
+	"time"
 )
 
 func TestStatusStore_UpdateAndGet(t *testing.T) {
@@ -101,6 +102,18 @@ func TestStatusStore_AllReturnsSortedOrder(t *testing.T) {
 	}
 }
 
+func TestStatusStore_BuildingStatus(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	store.Update("svc", StatusBuilding, "")
+
+	got := store.Get("svc")
+	if got.Status != StatusBuilding {
+		t.Errorf("status = %q, want %q", got.Status, StatusBuilding)
+	}
+}
+
 func TestStatusStore_AllSortedByName(t *testing.T) {
 	store := NewStatusStore()
 	names := []string{"frontend", "backend", "redis", "kafka", "db"}
@@ -114,5 +127,94 @@ func TestStatusStore_AllSortedByName(t *testing.T) {
 		if strings.Compare(all[i-1].Name, all[i].Name) > 0 {
 			t.Errorf("not sorted: %q before %q", all[i-1].Name, all[i].Name)
 		}
+	}
+}
+
+func TestStatusStore_SetLastChecked(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	now := time.Now()
+	store.SetLastChecked("svc", now)
+
+	got := store.Get("svc")
+	if got.LastChecked == "" {
+		t.Fatal("LastChecked should not be empty")
+	}
+	if got.LastChecked != now.Format(time.RFC3339) {
+		t.Errorf("LastChecked = %q, want %q", got.LastChecked, now.Format(time.RFC3339))
+	}
+}
+
+func TestStatusStore_SetLastChecked_NonexistentService(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"real"})
+	// Should not panic
+	store.SetLastChecked("nonexistent", time.Now())
+}
+
+func TestStatusStore_CompareAndSwapStatus_Success(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+	store.Update("svc", StatusHealthy, "")
+
+	swapped := store.CompareAndSwapStatus("svc", StatusHealthy, StatusRestarting)
+	if !swapped {
+		t.Fatal("expected swap to succeed")
+	}
+
+	got := store.Get("svc")
+	if got.Status != StatusRestarting {
+		t.Errorf("status = %q, want %q", got.Status, StatusRestarting)
+	}
+}
+
+func TestStatusStore_CompareAndSwapStatus_WrongOldStatus(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+	store.Update("svc", StatusFailed, "")
+
+	swapped := store.CompareAndSwapStatus("svc", StatusHealthy, StatusRestarting)
+	if swapped {
+		t.Fatal("expected swap to fail when old status doesn't match")
+	}
+
+	got := store.Get("svc")
+	if got.Status != StatusFailed {
+		t.Errorf("status should not change on failed swap, got %q", got.Status)
+	}
+}
+
+func TestStatusStore_ErrorClearedOnHealthy(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	// Simulate: service was failed, then recovers
+	store.Update("svc", StatusFailed, "connection refused")
+
+	got := store.Get("svc")
+	if got.Error != "connection refused" {
+		t.Fatalf("error should be set after failed update, got %q", got.Error)
+	}
+
+	// Transition to healthy — error must be cleared
+	store.Update("svc", StatusHealthy, "")
+
+	got = store.Get("svc")
+	if got.Status != StatusHealthy {
+		t.Errorf("status = %q, want healthy", got.Status)
+	}
+	if got.Error != "" {
+		t.Errorf("error should be cleared on healthy transition, got %q", got.Error)
+	}
+}
+
+func TestStatusStore_CompareAndSwapStatus_NonexistentService(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"real"})
+
+	swapped := store.CompareAndSwapStatus("nonexistent", StatusHealthy, StatusRestarting)
+	if swapped {
+		t.Fatal("expected swap to fail for nonexistent service")
 	}
 }

@@ -19,9 +19,10 @@ type Group struct {
 }
 
 type Service struct {
-	Name        string            `yaml:"name"`
-	Command     string            `yaml:"command"`
-	WorkingDir  string            `yaml:"working_dir"`
+	Name         string            `yaml:"name"`
+	Command      string            `yaml:"command"`
+	BuildCommand string            `yaml:"build_command"` // optional, runs before restart
+	WorkingDir   string            `yaml:"working_dir"`
 	Env         map[string]string `yaml:"env"`
 	DependsOn   []string          `yaml:"depends_on"`
 	OnFailure   string            `yaml:"on_failure"`
@@ -29,10 +30,12 @@ type Service struct {
 }
 
 type HealthCheck struct {
-	URL     string  `yaml:"url"`
-	Timeout int     `yaml:"timeout"`
-	Retries int     `yaml:"retries"`
-	Backoff Backoff `yaml:"backoff"`
+	URL                string  `yaml:"url"`
+	Timeout            int     `yaml:"timeout"`
+	Retries            int     `yaml:"retries"`
+	CheckInterval      int     `yaml:"check_interval"`       // seconds between continuous health pings
+	UnhealthyThreshold int     `yaml:"unhealthy_threshold"`   // consecutive failures before marking unhealthy
+	Backoff            Backoff `yaml:"backoff"`
 }
 
 type Backoff struct {
@@ -87,6 +90,12 @@ func (c *Config) fillDefaults() {
 			}
 			if svc.HealthCheck.Backoff.Multiplier == 0 {
 				svc.HealthCheck.Backoff.Multiplier = 2.0
+			}
+			if svc.HealthCheck.CheckInterval == 0 {
+				svc.HealthCheck.CheckInterval = 10
+			}
+			if svc.HealthCheck.UnhealthyThreshold == 0 {
+				svc.HealthCheck.UnhealthyThreshold = 2
 			}
 		}
 	}

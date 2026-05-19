@@ -76,6 +76,12 @@ groups:
 	if svc.HealthCheck.Backoff.Multiplier != 2.0 {
 		t.Errorf("backoff.multiplier default = %f, want 2.0", svc.HealthCheck.Backoff.Multiplier)
 	}
+	if svc.HealthCheck.CheckInterval != 10 {
+		t.Errorf("check_interval default = %d, want 10", svc.HealthCheck.CheckInterval)
+	}
+	if svc.HealthCheck.UnhealthyThreshold != 2 {
+		t.Errorf("unhealthy_threshold default = %d, want 2", svc.HealthCheck.UnhealthyThreshold)
+	}
 }
 
 func TestLoadConfig_DuplicateServiceNames(t *testing.T) {
@@ -202,6 +208,57 @@ groups:
 	}
 	if !strings.Contains(err.Error(), "command") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadConfig_BuildCommand(t *testing.T) {
+	yaml := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: svc
+        command: "./app"
+        build_command: "go build -o app ."
+        health_check:
+          url: "http://localhost:1"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	svc := cfg.Groups[0].Services[0]
+	if svc.BuildCommand != "go build -o app ." {
+		t.Errorf("build_command = %q, want %q", svc.BuildCommand, "go build -o app .")
+	}
+}
+
+func TestLoadConfig_BuildCommandDefault(t *testing.T) {
+	yaml := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: svc
+        command: "./app"
+        health_check:
+          url: "http://localhost:1"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	svc := cfg.Groups[0].Services[0]
+	if svc.BuildCommand != "" {
+		t.Errorf("build_command default = %q, want empty string", svc.BuildCommand)
 	}
 }
 

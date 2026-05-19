@@ -1,42 +1,93 @@
+# runAll 编排配置 — 与 task2app/conf/port_config.json 端口一致
+# 用法（在 runAll 目录）: ./runAll --config ./config.yaml
+# 前置: Docker Desktop（基础设施）、task2app 虚拟环境、各前端 npm install、go 工具链
+
 version: "1"
+
 groups:
   - name: infrastructure
     services:
-      - name: redis
-        command: "redis-server --port 6379"
+      # Redis + Kafka + Kafka UI（Saas_project/docker-compose.yml）
+      # 健康检查走 Kafka UI 的 HTTP；Redis/Kafka broker 无 HTTP 探针
+      - name: docker-infra
+        command: >-
+          (docker compose -f docker-compose.yml up -d 2>/dev/null
+          || docker-compose -f docker-compose.yml up -d)
+        working_dir: ../task2app/Saas_project
         health_check:
-          url: "http://localhost:6379"
-          timeout: 30
-          retries: 10
+          url: "http://127.0.0.1:8080"
+          timeout: 120
+          retries: 30
           backoff:
-            initial: 1.0
-            max: 8.0
+            initial: 2.0
+            max: 16.0
             multiplier: 2.0
-        on_failure: exit
+        on_failure: skip
 
-      - name: kafka
-        command: "docker start kafka"
-        health_check:
-          url: "http://localhost:9092"
-
-  - name: apps
+  - name: platform
     services:
-      - name: saas-backend
-        command: "python manage.py runserver 0.0.0.0:8000"
+      - name: git-oauth
+        command: "./run.sh"
+        working_dir: ../gitOauth
         health_check:
-          url: "http://localhost:8000/api/health"
-        depends_on: [redis, kafka]
-        working_dir: ./task2app/Saas_project
+          url: "http://127.0.0.1:8002/api/health/"
+          timeout: 60
+          retries: 15
+
+      - name: saas-backend
+        command: >-
+          bash -c 'source ./activate_env.sh run &&
+          cd Saas_project &&
+          python3 -u manage.py runserver 0.0.0.0:8001'
+        working_dir: ../task2app
+        depends_on: [git-oauth]
+        health_check:
+          url: "http://127.0.0.1:8001/api/health/"
+          timeout: 120
+          retries: 30
+          backoff:
+            initial: 2.0
+            max: 16.0
+            multiplier: 2.0
+
+      - name: vue-frontend
+        command: "npm run dev"
+        working_dir: ../task2app/front_project/app
+        depends_on: [saas-backend]
+        health_check:
+          url: "http://127.0.0.1:4000/health"
+          timeout: 90
+          retries: 20
+        on_failure: skip
+
+      - name: ai-provider
+        command: "bash run.sh build && bash run.sh start-embedded"
+        working_dir: ../task2app/Saas_Ai_Provider
+        depends_on: [saas-backend]
+        health_check:
+          url: "http://127.0.0.1:8010/api/health/"
+          timeout: 180
+          retries: 25
+          backoff:
+            initial: 2.0
+            max: 16.0
+            multiplier: 2.0
+        on_failure: skip
+
+  - name: container-stack
+    services:
+      - name: go-run-container
+        command: "go build -o go_run_container . && ./go_run_container"
+        working_dir: ../go_run_container
+        health_check:
+          url: "http://127.0.0.1:8796/health"
+          timeout: 60
+          retries: 15
 
       - name: go-relay
-        command: "./go_relayToTrae"
+        command: "go build -o go_relayToTrae . && ./go_relayToTrae"
+        working_dir: ../go_relayToTrae
         health_check:
-          url: "http://localhost:9090/healthz"
-        depends_on: [kafka]
-
-      - name: frontend
-        command: "npm run dev"
-        health_check:
-          url: "http://localhost:5173"
-        depends_on: [saas-backend]
-        on_failure: skip
+          url: "http://127.0.0.1:8797/health"
+          timeout: 60
+          retries: 15

@@ -101,3 +101,52 @@ func TestWaitHealthy_ContextCancel(t *testing.T) {
 		t.Fatal("expected error from cancelled context")
 	}
 }
+
+func TestCheckHealth_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	err := checkHealth(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckHealth_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	err := checkHealth(ctx, srv.URL)
+	if err == nil {
+		t.Fatal("expected error for 503")
+	}
+}
+
+func TestCheckHealth_ConnectionRefused(t *testing.T) {
+	ctx := context.Background()
+	err := checkHealth(ctx, "http://127.0.0.1:1/health")
+	if err == nil {
+		t.Fatal("expected error for connection refused")
+	}
+}
+
+func TestCheckHealth_ContextCanceled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := checkHealth(ctx, srv.URL)
+	if err == nil {
+		t.Fatal("expected error for canceled context")
+	}
+}

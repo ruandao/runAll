@@ -24,6 +24,7 @@
   .restart-btn { background: none; border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 16px; padding: 2px 8px; border-radius: 4px; line-height: 1; }
   .restart-btn:hover { background: #333; color: #fff; border-color: #888; }
   .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
+  .last-checked { font-size: 11px; color: #555; margin-left: auto; }
   .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
   .uptime { font-size: 12px; color: #888; margin-top: 20px; }
 </style>
@@ -78,6 +79,9 @@ async function refresh() {
       if (svc.error) {
         html += `<span class="error-msg">${esc(svc.error)}</span>`;
       }
+      if (svc.last_checked) {
+        html += `<span class="last-checked">checked: ${formatTime(svc.last_checked)}</span>`;
+      }
       html += `</div>`;
     }
   }
@@ -106,6 +110,12 @@ async function restartService(name) {
   } catch (err) {
     alert('Restart failed: ' + err.message);
   }
+}
+
+function formatTime(ts) {
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function esc(s) {
