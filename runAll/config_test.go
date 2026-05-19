@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -102,6 +103,9 @@ groups:
 	if err == nil {
 		t.Fatal("expected error for duplicate service names")
 	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestLoadConfig_MissingDependsOn(t *testing.T) {
@@ -124,6 +128,9 @@ groups:
 	if err == nil {
 		t.Fatal("expected error for missing depends_on reference")
 	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestLoadConfig_InvalidOnFailure(t *testing.T) {
@@ -145,6 +152,9 @@ groups:
 	_, err := LoadConfig(path)
 	if err == nil {
 		t.Fatal("expected error for invalid on_failure")
+	}
+	if !strings.Contains(err.Error(), "on_failure") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -190,6 +200,9 @@ groups:
 	if err == nil {
 		t.Fatal("expected error for missing command")
 	}
+	if !strings.Contains(err.Error(), "command") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestLoadConfig_MissingHealthCheckURL(t *testing.T) {
@@ -208,5 +221,8 @@ groups:
 	_, err := LoadConfig(path)
 	if err == nil {
 		t.Fatal("expected error for missing health_check.url")
+	}
+	if !strings.Contains(err.Error(), "health_check") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
