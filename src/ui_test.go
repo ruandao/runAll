@@ -37,6 +37,53 @@ func TestAPIStatus(t *testing.T) {
 	}
 }
 
+func TestAPIStatus_IncludesPortFields(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-port",
+					Command:     "npm run dev --port 3000",
+					HealthCheck: HealthCheck{URL: "http://localhost:8080/health"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	if runner == nil {
+		t.Fatal("runner is nil")
+	}
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var result []*ServiceStatus
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("len = %d, want 1", len(result))
+	}
+	if result[0].HealthPort != "8080" {
+		t.Fatalf("health_port = %q, want 8080", result[0].HealthPort)
+	}
+	if result[0].CommandPort != "3000" {
+		t.Fatalf("command_port = %q, want 3000", result[0].CommandPort)
+	}
+}
+
 func TestUIHomePage(t *testing.T) {
 	store := NewStatusStore()
 	store.Init([]string{"svc"})
@@ -60,9 +107,14 @@ func TestUIHomePage(t *testing.T) {
 		`data-action="build"`,
 		`data-action="restart"`,
 		`data-action="logs"`,
+		`data-action="clear-logs"`,
 		`id="logs-modal-refresh"`,
 		`/api/build`,
 		`/api/logs`,
+		`/api/logs/clear`,
+		`svc.health_port || '-'`,
+		`svc.command_port || '-'`,
+		`health/command:`,
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
@@ -257,6 +309,139 @@ func TestAPILogs_BadRequest(t *testing.T) {
 	}
 }
 
+func TestAPILogsClear_Success(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-logs-clear",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9981"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	entry, err := domain.NewLogEntry(time.Now(), "svc-logs-clear", domain.StreamStdout, "line-before-clear")
+	if err != nil {
+		t.Fatalf("NewLogEntry: %v", err)
+	}
+	runner.logRepository.Append("svc-logs-clear", entry)
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{"name":"svc-logs-clear"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if response["status"] != "ok" {
+		t.Fatalf("status body = %#v, want status=ok", response)
+	}
+	if got := runner.logRepository.Tail("svc-logs-clear", 10); len(got) != 0 {
+		t.Fatalf("remaining logs = %d, want 0", len(got))
+	}
+}
+
+func TestAPILogsClear_BadRequest(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-logs-clear-bad",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9980"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/logs/clear", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusMethodNotAllowed, "method not allowed")
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "invalid json")
+	})
+
+	t.Run("missing name", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{"name":"   "}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "name is required")
+	})
+
+	t.Run("unknown service", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{"name":"missing-service"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, `service "missing-service" not found`)
+	})
+
+	t.Run("runner nil", func(t *testing.T) {
+		muxWithNilRunner := http.NewServeMux()
+		registerUIHandlers(muxWithNilRunner, store, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{"name":"svc-logs-clear-bad"}`))
+		rec := httptest.NewRecorder()
+		muxWithNilRunner.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
+	})
+
+	t.Run("log repository nil", func(t *testing.T) {
+		runnerWithNilRepo, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{Name: "g1", Services: []Service{
+					{
+						Name:        "svc-logs-clear-bad",
+						Command:     "echo running",
+						HealthCheck: HealthCheck{URL: "http://localhost:9980"},
+					},
+				}},
+			},
+		}, store)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+		runnerWithNilRepo.logRepository = nil
+
+		muxWithNilRepo := http.NewServeMux()
+		registerUIHandlers(muxWithNilRepo, store, runnerWithNilRepo)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/logs/clear", strings.NewReader(`{"name":"svc-logs-clear-bad"}`))
+		rec := httptest.NewRecorder()
+		muxWithNilRepo.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "log repository is required")
+	})
+}
+
 func TestAPIBuild_WhitespaceNameReturnsRequired(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
@@ -360,6 +545,8 @@ func TestUILogsModal_CloseAndRefreshGuardsPresent(t *testing.T) {
 		"logsState.requestSerial += 1;",
 		"if (!logsState.open || !logsState.service)",
 		"if (!logsState.open || logsState.service !== name || reqId !== logsState.requestSerial)",
+		"if (logsState.open && logsState.service === name)",
+		"fetch('/api/logs/clear', {",
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {

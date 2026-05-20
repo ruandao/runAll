@@ -134,3 +134,51 @@ func TestInmemoryServiceLogRepository_TailReturnsCopy(t *testing.T) {
 		t.Fatalf("tail should return defensive copy, got %#v", second)
 	}
 }
+
+func TestInmemoryServiceLogRepository_ClearOnlyTargetService(t *testing.T) {
+	repo := NewInMemoryServiceLogRepository(10)
+	repo.Append("svc-a", mustLogEntry(t, "svc-a", domain.StreamStdout, "a-1"))
+	repo.Append("svc-a", mustLogEntry(t, "svc-a", domain.StreamStdout, "a-2"))
+	repo.Append("svc-b", mustLogEntry(t, "svc-b", domain.StreamStdout, "b-1"))
+
+	repo.Clear("svc-a")
+
+	aLogs := repo.Tail("svc-a", 10)
+	bLogs := repo.Tail("svc-b", 10)
+	if len(aLogs) != 0 {
+		t.Fatalf("len(aLogs) = %d, want 0", len(aLogs))
+	}
+	if len(bLogs) != 1 || bLogs[0].Message != "b-1" {
+		t.Fatalf("svc-b logs mismatch after clear: %#v", bLogs)
+	}
+}
+
+func TestInmemoryServiceLogRepository_ClearIdempotent(t *testing.T) {
+	repo := NewInMemoryServiceLogRepository(10)
+	repo.Append("svc-a", mustLogEntry(t, "svc-a", domain.StreamStdout, "a-1"))
+
+	repo.Clear("svc-a")
+	repo.Clear("svc-a")
+
+	logs := repo.Tail("svc-a", 10)
+	if len(logs) != 0 {
+		t.Fatalf("len(logs) = %d, want 0", len(logs))
+	}
+}
+
+func TestInmemoryServiceLogRepository_ClearEmptyServiceNoop(t *testing.T) {
+	repo := NewInMemoryServiceLogRepository(10)
+	repo.Append("svc-a", mustLogEntry(t, "svc-a", domain.StreamStdout, "a-1"))
+	repo.Append("svc-b", mustLogEntry(t, "svc-b", domain.StreamStdout, "b-1"))
+
+	repo.Clear("")
+
+	aLogs := repo.Tail("svc-a", 10)
+	bLogs := repo.Tail("svc-b", 10)
+	if len(aLogs) != 1 || aLogs[0].Message != "a-1" {
+		t.Fatalf("svc-a logs mismatch after noop clear: %#v", aLogs)
+	}
+	if len(bLogs) != 1 || bLogs[0].Message != "b-1" {
+		t.Fatalf("svc-b logs mismatch after noop clear: %#v", bLogs)
+	}
+}

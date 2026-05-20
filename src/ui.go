@@ -135,6 +135,41 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 		})
 	})
 
+	mux.HandleFunc("/api/logs/clear", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, "invalid json")
+			return
+		}
+		body.Name = strings.TrimSpace(body.Name)
+		if body.Name == "" {
+			writeJSONError(w, "name is required")
+			return
+		}
+		if runner == nil {
+			writeJSONError(w, "runner is required")
+			return
+		}
+		if runner.logRepository == nil {
+			writeJSONError(w, "log repository is required")
+			return
+		}
+		if runner.findService(body.Name) == nil {
+			writeJSONError(w, fmt.Sprintf("service %q not found", body.Name))
+			return
+		}
+
+		runner.logRepository.Clear(body.Name)
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)

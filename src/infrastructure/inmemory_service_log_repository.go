@@ -57,3 +57,14 @@ func (r *InMemoryServiceLogRepository) Tail(service string, lines int) []domain.
 	}
 	return append([]domain.LogEntry(nil), buffer[len(buffer)-lines:]...)
 }
+
+func (r *InMemoryServiceLogRepository) Clear(service string) {
+	if service == "" {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.buffers, service)
+}

@@ -41,6 +41,8 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 	for _, svc := range services {
 		store.SetCommand(svc.Name, svc.Command)
 		store.SetURL(svc.Name, svc.HealthCheck.URL)
+		store.SetHealthPort(svc.Name, domain.ResolveHealthPort(svc.HealthCheck.URL))
+		store.SetCommandPort(svc.Name, domain.ResolveCommandPort(svc.Command))
 	}
 
 	// Build dependency status references

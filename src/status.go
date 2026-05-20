@@ -24,6 +24,8 @@ type ServiceStatus struct {
 	Status    Status      `json:"status"`
 	DependsOn []DepStatus `json:"depends_on"`
 	Command   string      `json:"command"`
+	HealthPort string      `json:"health_port"`
+	CommandPort string      `json:"command_port"`
 	URL       string      `json:"url"`
 	PID       int         `json:"pid"`
 	StartedAt string      `json:"started_at"`
@@ -97,6 +99,22 @@ func (s *StatusStore) SetCommand(name, command string) {
 	defer s.mu.Unlock()
 	if svc, ok := s.services[name]; ok {
 		svc.Command = command
+	}
+}
+
+func (s *StatusStore) SetHealthPort(name, port string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if svc, ok := s.services[name]; ok {
+		svc.HealthPort = port
+	}
+}
+
+func (s *StatusStore) SetCommandPort(name, port string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if svc, ok := s.services[name]; ok {
+		svc.CommandPort = port
 	}
 }
 

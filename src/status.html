@@ -27,6 +27,8 @@
   .build-btn { border-color: #4b5563; color: #d1d5db; }
   .restart-btn { border-color: #1d4ed8; color: #bfdbfe; }
   .logs-btn { border-color: #7c3aed; color: #ddd6fe; }
+  .clear-logs-btn { border-color: #b45309; color: #fed7aa; }
+  .ports { font-size: 12px; color: #94a3b8; min-width: 120px; }
   .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
   .last-checked { font-size: 11px; color: #555; margin-left: auto; }
   .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
@@ -103,10 +105,12 @@ async function refresh() {
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
       html += `<span class="status">${svc.status}</span>`;
+      html += `<span class="ports">health/command: ${esc(svc.health_port || '-')} / ${esc(svc.command_port || '-')}</span>`;
       html += `<span class="actions">`;
       html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
       html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}">重启</button>`;
       html += `<button class="action-btn logs-btn" type="button" data-action="logs" data-name="${esc(svc.name)}">日志</button>`;
+      html += `<button class="action-btn clear-logs-btn" type="button" data-action="clear-logs" data-name="${esc(svc.name)}">清空日志</button>`;
       html += `</span>`;
       if (svc.depends_on && svc.depends_on.length > 0) {
         html += `<span class="deps">`;
@@ -142,6 +146,27 @@ async function buildService(name) {
 
 async function restartService(name) {
   await postServiceAction('/api/restart', name, 'Restart');
+}
+
+async function clearLogs(name) {
+  try {
+    const resp = await fetch('/api/logs/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const result = await parseJsonSafe(resp);
+    if (!resp.ok) {
+      alert('Clear logs failed: ' + (result.error || `${resp.status}`));
+      return;
+    }
+    if (logsState.open && logsState.service === name) {
+      fetchLogsOnce();
+    }
+    refresh();
+  } catch (err) {
+    alert('Clear logs failed: ' + err.message);
+  }
 }
 
 async function postServiceAction(url, name, label) {
@@ -307,6 +332,10 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
   if (action === 'logs') {
     openLogsModal(name);
+    return;
+  }
+  if (action === 'clear-logs') {
+    clearLogs(name);
   }
 });
 
