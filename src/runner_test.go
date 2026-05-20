@@ -12,6 +12,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"runAll/src/domain"
+	"runAll/src/infrastructure"
 )
 
 func TestRunBuild_Success(t *testing.T) {
@@ -106,6 +109,200 @@ func TestRunBuild_ContextCanceled(t *testing.T) {
 	err := runner.runBuild(ctx, svc)
 	if err == nil {
 		t.Fatal("expected error for canceled context")
+	}
+}
+
+func TestRunBuild_AppendsStructuredLogs(t *testing.T) {
+	repo := infrastructure.NewInMemoryServiceLogRepository(100)
+	runner := &Runner{logRepository: repo}
+	svc := &Service{
+		Name:         "test-build-logs",
+		BuildCommand: "echo out-line; echo err-line 1>&2",
+	}
+
+	ctx := context.Background()
+	err := runner.runBuild(ctx, svc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var logs []domain.LogEntry
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logs = repo.Tail("test-build-logs", 10)
+		if len(logs) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if len(logs) < 2 {
+		t.Fatalf("expected at least 2 log lines, got %d", len(logs))
+	}
+
+	foundOut := false
+	foundErr := false
+	for _, line := range logs {
+		if line.Message == "out-line" && line.Stream == domain.StreamStdout {
+			foundOut = true
+		}
+		if line.Message == "err-line" && line.Stream == domain.StreamStderr {
+			foundErr = true
+		}
+	}
+	if !foundOut || !foundErr {
+		t.Fatalf("structured logs missing expected entries: %#v", logs)
+	}
+}
+
+func TestBuildService_Success(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "build-only-ok",
+					BuildCommand: "echo built",
+					Command:      "echo running",
+					HealthCheck:  HealthCheck{URL: "http://localhost:9998"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("build-only-ok", StatusHealthy, "")
+	err = runner.BuildService(context.Background(), "build-only-ok")
+	if err != nil {
+		t.Fatalf("BuildService: unexpected error: %v", err)
+	}
+
+	status := store.Get("build-only-ok")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", status)
+	}
+}
+
+func TestBuildService_Failure(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "build-only-fail",
+					BuildCommand: "exit 7",
+					Command:      "echo running",
+					HealthCheck:  HealthCheck{URL: "http://localhost:9997"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("build-only-fail", StatusHealthy, "")
+	err = runner.BuildService(context.Background(), "build-only-fail")
+	if err == nil {
+		t.Fatal("expected build failure")
+	}
+	if !strings.Contains(err.Error(), "build failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	status := store.Get("build-only-fail")
+	if status == nil || status.Status != StatusFailed {
+		t.Fatalf("status = %#v, want failed", status)
+	}
+}
+
+func TestBuildService_NotFound(t *testing.T) {
+	runner := &Runner{
+		cfg:   &Config{},
+		store: NewStatusStore(),
+	}
+
+	err := runner.BuildService(context.Background(), "missing-service")
+	if err == nil {
+		t.Fatal("expected not found error")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildService_StatusConflict(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "build-conflict",
+					BuildCommand: "echo built",
+					Command:      "echo running",
+					HealthCheck:  HealthCheck{URL: "http://localhost:9996"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("build-conflict", StatusRestarting, "")
+	err = runner.BuildService(context.Background(), "build-conflict")
+	if err == nil {
+		t.Fatal("expected status conflict error")
+	}
+	if !strings.Contains(err.Error(), "can only build healthy or failed services") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildService_ConcurrentBuildRejected(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "build-concurrent",
+					BuildCommand: "sleep 1",
+					Command:      "echo running",
+					HealthCheck:  HealthCheck{URL: "http://localhost:9996"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("build-concurrent", StatusHealthy, "")
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		firstErrCh <- runner.BuildService(context.Background(), "build-concurrent")
+	}()
+
+	waitForStatus(t, store, "build-concurrent", StatusBuilding, 2*time.Second)
+
+	secondErr := runner.BuildService(context.Background(), "build-concurrent")
+	if secondErr == nil {
+		t.Fatal("expected second concurrent build to be rejected")
+	}
+	if !strings.Contains(secondErr.Error(), "can only build healthy or failed services") {
+		t.Fatalf("unexpected second error: %v", secondErr)
+	}
+
+	firstErr := <-firstErrCh
+	if firstErr != nil {
+		t.Fatalf("first build should succeed, got: %v", firstErr)
 	}
 }
 

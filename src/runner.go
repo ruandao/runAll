@@ -11,16 +11,20 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"runAll/src/domain"
+	"runAll/src/infrastructure"
 )
 
 type Runner struct {
-	cfg       *Config
-	store     *StatusStore
-	levels    []ExecutionLevel
-	processes map[string]*exec.Cmd
-	mu        sync.Mutex
-	monitors  map[string]context.CancelFunc
-	monitorMu sync.Mutex
+	cfg           *Config
+	store         *StatusStore
+	levels        []ExecutionLevel
+	processes     map[string]*exec.Cmd
+	mu            sync.Mutex
+	monitors      map[string]context.CancelFunc
+	monitorMu     sync.Mutex
+	logRepository domain.ServiceLogRepository
 }
 
 func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
@@ -54,11 +58,12 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 	}
 
 	return &Runner{
-		cfg:       cfg,
-		store:     store,
-		levels:    levels,
-		processes: make(map[string]*exec.Cmd),
-		monitors:  make(map[string]context.CancelFunc),
+		cfg:           cfg,
+		store:         store,
+		levels:        levels,
+		processes:     make(map[string]*exec.Cmd),
+		monitors:      make(map[string]context.CancelFunc),
+		logRepository: infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity),
 	}, nil
 }
 
@@ -204,8 +209,8 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	r.mu.Unlock()
 	r.store.SetPID(svc.Name, cmd.Process.Pid)
 
-	go streamOutput(stdout, svc.Name)
-	go streamOutput(stderr, svc.Name)
+	go streamOutput(stdout, svc.Name, domain.StreamStdout, r.logRepository)
+	go streamOutput(stderr, svc.Name, domain.StreamStderr, r.logRepository)
 
 	// Health check
 	r.store.Update(svc.Name, StatusRetrying, "")
@@ -305,6 +310,37 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 	return nil
 }
 
+func (r *Runner) BuildService(ctx context.Context, name string) error {
+	svc := r.findService(name)
+	if svc == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	if svc.BuildCommand == "" {
+		return fmt.Errorf("service %q has no build command configured", name)
+	}
+
+	previousStatus := StatusFailed
+	if r.store.CompareAndSwapStatus(name, StatusHealthy, StatusBuilding) {
+		previousStatus = StatusHealthy
+	} else if !r.store.CompareAndSwapStatus(name, StatusFailed, StatusBuilding) {
+		current := r.store.Get(name)
+		if current == nil {
+			return fmt.Errorf("service %q not found", name)
+		}
+		return fmt.Errorf("service %q is %s, can only build healthy or failed services", name, current.Status)
+	}
+
+	log.Printf("[%s] build-only requested", name)
+
+	if err := r.runBuild(ctx, svc); err != nil {
+		r.store.Update(name, StatusFailed, err.Error())
+		return err
+	}
+
+	r.store.Update(name, previousStatus, "")
+	return nil
+}
+
 func (r *Runner) findService(name string) *Service {
 	for _, g := range r.cfg.Groups {
 		for _, svc := range g.Services {
@@ -374,8 +410,8 @@ func (r *Runner) runBuild(ctx context.Context, svc *Service) error {
 		return fmt.Errorf("[%s] build failed to start: %w", svc.Name, err)
 	}
 
-	go streamOutput(stdout, svc.Name)
-	go streamOutput(stderr, svc.Name)
+	go streamOutput(stdout, svc.Name, domain.StreamStdout, r.logRepository)
+	go streamOutput(stderr, svc.Name, domain.StreamStderr, r.logRepository)
 
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("[%s] build failed: %w", svc.Name, err)
@@ -385,10 +421,19 @@ func (r *Runner) runBuild(ctx context.Context, svc *Service) error {
 	return nil
 }
 
-func streamOutput(r io.Reader, name string) {
-	scanner := bufio.NewScanner(r)
+func streamOutput(reader io.Reader, name, stream string, repository domain.ServiceLogRepository) {
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
-		log.Printf("[%s] %s", name, scanner.Text())
+		line := scanner.Text()
+		log.Printf("[%s] %s", name, line)
+		if repository != nil {
+			entry, err := domain.NewLogEntry(time.Now(), name, stream, line)
+			if err != nil {
+				log.Printf("[%s] log entry skipped: %v", name, err)
+				continue
+			}
+			repository.Append(name, entry)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("[%s] output read error: %v", name, err)

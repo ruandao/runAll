@@ -21,12 +21,27 @@
   .dot.gray { background: #6b7280; }
   .dot.red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
   .dot.dark { background: #374151; }
-  .restart-btn { background: none; border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 16px; padding: 2px 8px; border-radius: 4px; line-height: 1; }
-  .restart-btn:hover { background: #333; color: #fff; border-color: #888; }
+  .actions { display: inline-flex; gap: 6px; margin-left: 8px; }
+  .action-btn { border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 4px; background: #111827; }
+  .action-btn:hover { background: #1f2937; color: #fff; border-color: #888; }
+  .build-btn { border-color: #4b5563; color: #d1d5db; }
+  .restart-btn { border-color: #1d4ed8; color: #bfdbfe; }
+  .logs-btn { border-color: #7c3aed; color: #ddd6fe; }
   .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
   .last-checked { font-size: 11px; color: #555; margin-left: auto; }
   .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
   .uptime { font-size: 12px; color: #888; margin-top: 20px; }
+  .logs-modal { position: fixed; inset: 0; background: rgba(7, 11, 24, 0.75); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 20; }
+  .logs-modal.open { display: flex; }
+  .logs-modal-content { width: min(940px, 100%); max-height: 85vh; background: #0f172a; border: 1px solid #334155; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
+  .logs-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #1e293b; font-size: 13px; }
+  .logs-modal-title { font-weight: 600; }
+  .logs-modal-meta { color: #94a3b8; font-size: 11px; }
+  .logs-modal-actions { display: inline-flex; gap: 8px; }
+  .logs-modal-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
+  .logs-modal-btn:hover { background: #1e293b; color: #fff; }
+  .logs-content { margin: 0; padding: 12px 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow: auto; color: #dbeafe; min-height: 280px; background: #020617; }
+  .logs-placeholder { color: #94a3b8; }
 </style>
 </head>
 <body>
@@ -34,11 +49,34 @@
 <div class="subtitle">auto-refresh every 2s</div>
 <div id="services"></div>
 <div class="uptime" id="uptime"></div>
+<div id="logs-modal" class="logs-modal" aria-hidden="true">
+  <div class="logs-modal-content" role="dialog" aria-modal="true" aria-labelledby="logs-modal-title">
+    <div class="logs-modal-header">
+      <div>
+        <div id="logs-modal-title" class="logs-modal-title">Service Logs</div>
+        <div id="logs-modal-meta" class="logs-modal-meta">last 200 lines, auto-refresh every 2s</div>
+      </div>
+      <div class="logs-modal-actions">
+        <button id="logs-modal-refresh" class="logs-modal-btn" type="button">Refresh</button>
+        <button id="logs-modal-close" class="logs-modal-btn" type="button">Close</button>
+      </div>
+    </div>
+    <pre id="logs-content" class="logs-content logs-placeholder">Select a service to view logs.</pre>
+  </div>
+</div>
 <script>
 const startTime = Date.now();
+const statusRefreshMs = 2000;
+const logLines = 200;
 const dotClass = {
   healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
   pending: 'gray', failed: 'red', skipped: 'dark'
+};
+const logsState = {
+  open: false,
+  service: '',
+  timerId: null,
+  requestSerial: 0,
 };
 
 async function refresh() {
@@ -65,9 +103,11 @@ async function refresh() {
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
       html += `<span class="status">${svc.status}</span>`;
-	      if (svc.status === 'healthy' || svc.status === 'failed') {
-	        html += `<button class="restart-btn" onclick="restartService('${esc(svc.name)}')" title="Restart">&#x21bb;</button>`;
-	      }
+      html += `<span class="actions">`;
+      html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
+      html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}">重启</button>`;
+      html += `<button class="action-btn logs-btn" type="button" data-action="logs" data-name="${esc(svc.name)}">日志</button>`;
+      html += `</span>`;
       if (svc.depends_on && svc.depends_on.length > 0) {
         html += `<span class="deps">`;
         for (const dep of svc.depends_on) {
@@ -96,20 +136,143 @@ async function refresh() {
   }
 }
 
+async function buildService(name) {
+  await postServiceAction('/api/build', name, 'Build');
+}
+
 async function restartService(name) {
+  await postServiceAction('/api/restart', name, 'Restart');
+}
+
+async function postServiceAction(url, name, label) {
   try {
-    const resp = await fetch('/api/restart', {
+    const resp = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name: name})
     });
-    const result = await resp.json();
+    const result = await parseJsonSafe(resp);
     if (!resp.ok) {
-      alert('Restart failed: ' + (result.error || 'unknown error'));
+      alert(`${label} failed: ` + (result.error || `${resp.status}`));
+      return;
     }
+    refresh();
   } catch (err) {
-    alert('Restart failed: ' + err.message);
+    alert(`${label} failed: ` + err.message);
   }
+}
+
+function openLogsModal(name) {
+  logsState.open = true;
+  logsState.service = name;
+  logsState.requestSerial += 1;
+  const modal = document.getElementById('logs-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  updateLogsMeta('loading...');
+  document.getElementById('logs-content').textContent = 'Loading logs...';
+  stopLogsAutoRefresh();
+  fetchLogsOnce();
+  logsState.timerId = setInterval(fetchLogsOnce, statusRefreshMs);
+}
+
+function closeLogsModal() {
+  logsState.open = false;
+  logsState.service = '';
+  logsState.requestSerial += 1;
+  stopLogsAutoRefresh();
+  const modal = document.getElementById('logs-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function stopLogsAutoRefresh() {
+  if (logsState.timerId !== null) {
+    clearInterval(logsState.timerId);
+    logsState.timerId = null;
+  }
+}
+
+async function fetchLogsOnce() {
+  if (!logsState.open || !logsState.service) {
+    return;
+  }
+  const reqId = ++logsState.requestSerial;
+  const name = logsState.service;
+  try {
+    const query = new URLSearchParams({name, lines: String(logLines)});
+    const resp = await fetch(`/api/logs?${query.toString()}`);
+    const result = await parseJsonSafe(resp);
+    if (!resp.ok) {
+      throw new Error(result.error || `HTTP ${resp.status}`);
+    }
+    if (!logsState.open || logsState.service !== name || reqId !== logsState.requestSerial) {
+      return;
+    }
+    renderLogs(result);
+  } catch (err) {
+    if (!logsState.open || logsState.service !== name || reqId !== logsState.requestSerial) {
+      return;
+    }
+    updateLogsMeta('refresh failed');
+    document.getElementById('logs-content').textContent = `Failed to load logs: ${err.message}`;
+  }
+}
+
+function renderLogs(payload) {
+  const name = payload && payload.name ? String(payload.name) : logsState.service;
+  const rows = normalizeLogRows(payload && payload.lines ? payload.lines : []);
+  const content = document.getElementById('logs-content');
+  content.textContent = rows.length > 0 ? rows.join('\n') : 'No logs available.';
+  updateLogsMeta(`${rows.length} lines - refreshed at ${formatNowTime()}`);
+  document.getElementById('logs-modal-title').textContent = `${name} logs`;
+}
+
+function normalizeLogRows(lines) {
+  if (!Array.isArray(lines)) {
+    return [];
+  }
+  return lines.map((line) => {
+    if (typeof line === 'string') {
+      return line;
+    }
+    if (line && typeof line === 'object') {
+      const ts = line.timestamp ? `[${formatLogTime(line.timestamp)}] ` : '';
+      const stream = line.stream ? `(${line.stream}) ` : '';
+      const message = line.message !== undefined ? String(line.message) : JSON.stringify(line);
+      return `${ts}${stream}${message}`;
+    }
+    return String(line);
+  });
+}
+
+async function parseJsonSafe(resp) {
+  try {
+    return await resp.json();
+  } catch (_) {
+    return {};
+  }
+}
+
+function updateLogsMeta(text) {
+  document.getElementById('logs-modal-meta').textContent = `${logsState.service || '-'} - ${text} - last ${logLines} lines`;
+}
+
+function formatNowTime() {
+  return formatDateTime(new Date());
+}
+
+function formatLogTime(ts) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) {
+    return String(ts);
+  }
+  return formatDateTime(d);
+}
+
+function formatDateTime(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function formatTime(ts) {
@@ -124,8 +287,44 @@ function esc(s) {
   return el.innerHTML;
 }
 
+document.getElementById('services').addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-action][data-name]');
+  if (!btn) {
+    return;
+  }
+  const action = btn.getAttribute('data-action');
+  const name = btn.getAttribute('data-name');
+  if (!name) {
+    return;
+  }
+  if (action === 'build') {
+    buildService(name);
+    return;
+  }
+  if (action === 'restart') {
+    restartService(name);
+    return;
+  }
+  if (action === 'logs') {
+    openLogsModal(name);
+  }
+});
+
+document.getElementById('logs-modal-close').addEventListener('click', closeLogsModal);
+document.getElementById('logs-modal-refresh').addEventListener('click', fetchLogsOnce);
+document.getElementById('logs-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'logs-modal') {
+    closeLogsModal();
+  }
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && logsState.open) {
+    closeLogsModal();
+  }
+});
+
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, statusRefreshMs);
 </script>
 </body>
 </html>
