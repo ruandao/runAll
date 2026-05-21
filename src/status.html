@@ -83,7 +83,7 @@ const minLogsPanelWidth = 320;
 const minServicePanelWidth = 380;
 const dotClass = {
   healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
-  pending: 'gray', failed: 'red', skipped: 'dark'
+  pending: 'gray', stopped: 'gray', failed: 'red', skipped: 'dark'
 };
 const logsState = {
   open: false,
@@ -102,19 +102,35 @@ async function refresh() {
     const data = await resp.json();
     const container = document.getElementById('services');
     let html = '';
-    // Group by DAG level (approximate by depends_on depth)
-  const byLevel = new Map();
-  for (const svc of data) {
-    const depth = svc.depends_on ? svc.depends_on.length : 0;
-    if (!byLevel.has(depth)) byLevel.set(depth, []);
-    byLevel.get(depth).push(svc);
-  }
+    const byGroup = new Map();
+    for (const svc of data) {
+      const groupName = typeof svc.group === 'string' ? svc.group.trim() : '';
+      const groupKey = groupName || 'ungrouped';
+      if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
+      byGroup.get(groupKey).push(svc);
+    }
 
-  const sortedLevels = [...byLevel.entries()].sort((a, b) => a[0] - b[0]);
-  for (const [depth, services] of sortedLevels) {
-    html += `<div class="level-header">Level ${depth}</div>`;
-    for (const svc of services) {
+    const sortedGroups = [...byGroup.entries()].sort((a, b) => {
+      if (a[0] === 'ungrouped') return 1;
+      if (b[0] === 'ungrouped') return -1;
+      return a[0].localeCompare(b[0]);
+    });
+
+    for (const [groupKey, services] of sortedGroups) {
+      const stopGroupBtn = groupKey !== 'ungrouped' ? ` <button class="action-btn" type="button" data-action="stop-group" data-group="${esc(groupKey)}">关闭本组</button>` : '';
+      const title = groupKey === 'ungrouped' ? 'Ungrouped' : `Group ${groupKey}`;
+      html += `<div class="level-header">${esc(title)}${stopGroupBtn}</div>`;
+      const sortedServices = [...services].sort((a, b) => {
+        const depthA = a.depends_on ? a.depends_on.length : 0;
+        const depthB = b.depends_on ? b.depends_on.length : 0;
+        if (depthA !== depthB) return depthA - depthB;
+        return String(a.name || '').localeCompare(String(b.name || ''));
+      });
+      for (const svc of sortedServices) {
       const cls = dotClass[svc.status] || 'gray';
+      const isStopped = svc.status === 'stopped';
+      const toggleAction = isStopped ? 'start' : 'stop';
+      const toggleLabel = isStopped ? '启动' : '关闭';
       const healthPort = normalizePortValue(svc.health_port);
       const commandPort = normalizePortValue(svc.command_port);
       const healthHref = resolveHealthHref(svc.url, healthPort);
@@ -125,6 +141,7 @@ async function refresh() {
       html += `<span class="status">${svc.status}</span>`;
       html += `<span class="ports">health/command: ${portLink(healthPort, healthHref)} / ${portLink(commandPort, commandHref)}</span>`;
       html += `<span class="actions">`;
+      html += `<button class="action-btn" type="button" data-action="${toggleAction}" data-name="${esc(svc.name)}">${toggleLabel}</button>`;
       html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
       html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}">重启</button>`;
       html += `<button class="action-btn logs-btn" type="button" data-action="logs" data-name="${esc(svc.name)}">日志</button>`;
@@ -145,9 +162,9 @@ async function refresh() {
         html += `<span class="last-checked">checked: ${formatTime(svc.last_checked)}</span>`;
       }
       html += `</div>`;
+      }
     }
-  }
-  container.innerHTML = html;
+    container.innerHTML = html;
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
@@ -164,6 +181,18 @@ async function buildService(name) {
 
 async function restartService(name) {
   await postServiceAction('/api/restart', name, 'Restart');
+}
+
+async function stopService(name) {
+  await postServiceAction('/api/stop', name, 'Stop');
+}
+
+async function startService(name) {
+  await postServiceAction('/api/start', name, 'Start');
+}
+
+async function stopGroup(group) {
+  await postGroupAction('/api/stop-group', group, 'Stop group');
 }
 
 async function clearLogs(name) {
@@ -193,6 +222,24 @@ async function postServiceAction(url, name, label) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name: name})
+    });
+    const result = await parseJsonSafe(resp);
+    if (!resp.ok) {
+      alert(`${label} failed: ` + (result.error || `${resp.status}`));
+      return;
+    }
+    refresh();
+  } catch (err) {
+    alert(`${label} failed: ` + err.message);
+  }
+}
+
+async function postGroupAction(url, group, label) {
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({group: group})
     });
     const result = await parseJsonSafe(resp);
     if (!resp.ok) {
@@ -422,29 +469,43 @@ function handleDividerPointerUp() {
 }
 
 document.getElementById('services').addEventListener('click', (event) => {
-  const btn = event.target.closest('button[data-action][data-name]');
+  const btn = event.target.closest('button[data-action]');
   if (!btn) {
     return;
   }
   const action = btn.getAttribute('data-action');
   const name = btn.getAttribute('data-name');
-  if (!name) {
+  const group = btn.getAttribute('data-group');
+  if (action === 'start' && name) {
+    startService(name);
+    return;
+  }
+  if (action === 'stop' && name) {
+    stopService(name);
     return;
   }
   if (action === 'build') {
+    if (!name) return;
     buildService(name);
     return;
   }
   if (action === 'restart') {
+    if (!name) return;
     restartService(name);
     return;
   }
   if (action === 'logs') {
+    if (!name) return;
     openLogsPanel(name);
     return;
   }
   if (action === 'clear-logs') {
+    if (!name) return;
     clearLogs(name);
+    return;
+  }
+  if (action === 'stop-group' && group) {
+    stopGroup(group);
   }
 });
 

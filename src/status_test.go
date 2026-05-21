@@ -114,6 +114,18 @@ func TestStatusStore_BuildingStatus(t *testing.T) {
 	}
 }
 
+func TestStatusStore_StoppedStatus(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	store.Update("svc", StatusStopped, "")
+
+	got := store.Get("svc")
+	if got.Status != StatusStopped {
+		t.Errorf("status = %q, want %q", got.Status, StatusStopped)
+	}
+}
+
 func TestStatusStore_AllSortedByName(t *testing.T) {
 	store := NewStatusStore()
 	names := []string{"frontend", "backend", "redis", "kafka", "db"}

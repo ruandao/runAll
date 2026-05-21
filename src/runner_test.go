@@ -372,7 +372,7 @@ func TestRestartService_WithBuildCommand_Success(t *testing.T) {
 	}
 }
 
-func TestRestartService_WithBuildCommand_Failure(t *testing.T) {
+func TestRestartService_WithBuildCommand_FailureKeepsPreviousStatus(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
 		Version: "1",
@@ -402,8 +402,8 @@ func TestRestartService_WithBuildCommand_Failure(t *testing.T) {
 	}
 
 	status := store.Get("build-fail")
-	if status.Status != StatusFailed {
-		t.Errorf("status = %q, want %q", status.Status, StatusFailed)
+	if status.Status != StatusHealthy {
+		t.Errorf("status = %q, want %q", status.Status, StatusHealthy)
 	}
 	if status.Error == "" {
 		t.Error("error message should be set")
@@ -538,6 +538,504 @@ func TestRestartService_BuildFailurePreservesProcess(t *testing.T) {
 	runner.mu.Unlock()
 	if !exists {
 		t.Error("process should still exist in map after build failure (stopProcess must not be called)")
+	}
+
+	status := store.Get("keep-process")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusHealthy {
+		t.Fatalf("status = %s, want %s when build fails before stop", status.Status, StatusHealthy)
+	}
+}
+
+func TestRunner_StopService_BlockedByActiveDownstreamDependency(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "db",
+						Command:     "echo db",
+						HealthCheck: HealthCheck{URL: "http://localhost:9101"},
+					},
+					{
+						Name:        "api",
+						Command:     "echo api",
+						DependsOn:   []string{"db"},
+						HealthCheck: HealthCheck{URL: "http://localhost:9102"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("db", StatusHealthy, "")
+	store.Update("api", StatusHealthy, "")
+
+	err = runner.StopService(context.Background(), "db")
+	if err == nil {
+		t.Fatal("expected stop to be blocked by active downstream dependency")
+	}
+	if !strings.Contains(err.Error(), "active downstream dependencies") || !strings.Contains(err.Error(), "api") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StopService_SetsStoppedStatus(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "worker",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9201"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("worker", StatusHealthy, "")
+
+	if err := runner.StopService(context.Background(), "worker"); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+
+	status := store.Get("worker")
+	if status == nil || status.Status != StatusStopped {
+		t.Fatalf("status = %#v, want stopped", status)
+	}
+}
+
+func TestRunner_StopService_AllowsRetryingStatus(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "retrying-worker",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9202"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("retrying-worker", StatusRetrying, "")
+
+	if err := runner.StopService(context.Background(), "retrying-worker"); err != nil {
+		t.Fatalf("StopService should allow retrying status, got: %v", err)
+	}
+
+	status := store.Get("retrying-worker")
+	if status == nil || status.Status != StatusStopped {
+		t.Fatalf("status = %#v, want stopped", status)
+	}
+}
+
+func TestRunner_StopService_ClearsPID(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "pid-worker",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9203"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("pid-worker", StatusHealthy, "")
+	store.SetPID("pid-worker", 12345)
+
+	if err := runner.StopService(context.Background(), "pid-worker"); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+
+	status := store.Get("pid-worker")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.PID != 0 {
+		t.Fatalf("pid = %d, want 0", status.PID)
+	}
+}
+
+func TestRunner_StartService_FromStopped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "startable",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:           srv.URL,
+							Timeout:       2,
+							Retries:       2,
+							CheckInterval: 1,
+							Backoff:       Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("startable", StatusStopped, "")
+
+	if err := runner.StartService(context.Background(), "startable"); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+
+	got := store.Get("startable")
+	if got == nil || got.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", got)
+	}
+
+	runner.monitorMu.Lock()
+	_, monitorExists := runner.monitors["startable"]
+	runner.monitorMu.Unlock()
+	if !monitorExists {
+		t.Fatal("expected monitor to be resumed after start")
+	}
+
+	if err := runner.StopService(context.Background(), "startable"); err != nil {
+		t.Fatalf("cleanup StopService: %v", err)
+	}
+}
+
+func TestRunner_StartService_RejectsNonStoppedStatus(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "busy-svc",
+						Command:     "echo busy",
+						HealthCheck: HealthCheck{URL: "http://localhost:9302"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("busy-svc", StatusHealthy, "")
+
+	err = runner.StartService(context.Background(), "busy-svc")
+	if err == nil {
+		t.Fatal("expected start to be rejected for non-stopped status")
+	}
+	if !strings.Contains(err.Error(), "can only start stopped") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StartService_OnFailureSkipStillReturnsError(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "skip-start",
+						Command: "sleep 1",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:65534/unhealthy",
+							Timeout: 1,
+							Retries: 1,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.1,
+								Multiplier: 1.0,
+							},
+						},
+						OnFailure: "skip",
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("skip-start", StatusStopped, "")
+	err = runner.StartService(context.Background(), "skip-start")
+	if err == nil {
+		t.Fatal("expected start failure error even when on_failure=skip")
+	}
+}
+
+func TestRunner_StartService_FailureUpdatesDependentStatus(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "worker",
+						Command: "sleep 1",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:65534/unhealthy",
+							Timeout: 1,
+							Retries: 1,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.1,
+								Multiplier: 1.0,
+							},
+						},
+						OnFailure: "skip",
+					},
+					{
+						Name:      "api",
+						Command:   "echo api",
+						DependsOn: []string{"worker"},
+						HealthCheck: HealthCheck{
+							URL: "http://localhost:9401",
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("worker", StatusStopped, "")
+	if err := runner.StartService(context.Background(), "worker"); err == nil {
+		t.Fatal("expected start to fail")
+	}
+
+	apiStatus := store.Get("api")
+	if apiStatus == nil {
+		t.Fatal("api status should exist")
+	}
+	if len(apiStatus.DependsOn) != 1 {
+		t.Fatalf("depends_on length = %d, want 1", len(apiStatus.DependsOn))
+	}
+	if apiStatus.DependsOn[0].Status != StatusFailed {
+		t.Fatalf("dependency status = %s, want %s", apiStatus.DependsOn[0].Status, StatusFailed)
+	}
+}
+
+func TestRunner_StartService_OnFailureExitCleansUpProcessAndPID(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "exit-start",
+						Command: "sleep 1",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:65534/unhealthy",
+							Timeout: 1,
+							Retries: 1,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.1,
+								Multiplier: 1.0,
+							},
+						},
+						OnFailure: "exit",
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("exit-start", StatusStopped, "")
+	err = runner.StartService(context.Background(), "exit-start")
+	if err == nil {
+		t.Fatal("expected start to fail")
+	}
+
+	status := store.Get("exit-start")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.PID != 0 {
+		t.Fatalf("pid = %d, want 0", status.PID)
+	}
+
+	runner.mu.Lock()
+	_, exists := runner.processes["exit-start"]
+	runner.mu.Unlock()
+	if exists {
+		t.Fatal("process should be removed after failed start cleanup")
+	}
+}
+
+func TestRunner_RestartService_OnFailureSkipReturnsErrorAndCleansUp(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "restart-skip",
+						Command: "sleep 1",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:65534/unhealthy",
+							Timeout: 1,
+							Retries: 1,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.1,
+								Multiplier: 1.0,
+							},
+						},
+						OnFailure: "skip",
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("restart-skip", StatusHealthy, "")
+	err = runner.RestartService(context.Background(), "restart-skip")
+	if err == nil {
+		t.Fatal("expected restart failure error when health check fails")
+	}
+
+	status := store.Get("restart-skip")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.PID != 0 {
+		t.Fatalf("pid = %d, want 0", status.PID)
+	}
+}
+
+func TestRunner_StopService_BlocksFailedDependentWithRunningPID(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "db",
+						Command:     "echo db",
+						HealthCheck: HealthCheck{URL: "http://localhost:9501"},
+					},
+					{
+						Name:      "api",
+						Command:   "echo api",
+						DependsOn: []string{"db"},
+						HealthCheck: HealthCheck{
+							URL: "http://localhost:9502",
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("db", StatusHealthy, "")
+	store.Update("api", StatusFailed, "health failed")
+	store.SetPID("api", 9876)
+
+	err = runner.StopService(context.Background(), "db")
+	if err == nil {
+		t.Fatal("expected stop to be blocked by failed dependent with running pid")
+	}
+	if !strings.Contains(err.Error(), "api") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StopGroup_GroupNotFound(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "existing",
+				Services: []Service{
+					{
+						Name:        "svc",
+						Command:     "echo svc",
+						HealthCheck: HealthCheck{URL: "http://localhost:9301"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	err = runner.StopGroup(context.Background(), "missing-group")
+	if err == nil {
+		t.Fatal("expected group not found error")
+	}
+	if !strings.Contains(err.Error(), "group \"missing-group\" not found") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

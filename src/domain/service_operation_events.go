@@ -19,3 +19,28 @@ type ServiceLogsRead struct {
 	OccurredAt  time.Time
 	Lines       int
 }
+
+type ServiceStopRequested struct {
+	ServiceName string
+	OccurredAt  time.Time
+}
+
+type ServiceStopped struct {
+	ServiceName string
+	OccurredAt  time.Time
+}
+
+type ServiceStartRequested struct {
+	ServiceName string
+	OccurredAt  time.Time
+}
+
+type ServiceStarted struct {
+	ServiceName string
+	OccurredAt  time.Time
+}
+
+type ServiceGroupStopRequested struct {
+	GroupName  string
+	OccurredAt time.Time
+}

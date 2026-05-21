@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +29,65 @@ type Runner struct {
 	logRepository domain.ServiceLogRepository
 }
 
+type runnerRuntimeContextRepository struct {
+	runner *Runner
+}
+
+func (r *runnerRuntimeContextRepository) FindByName(name string) (domain.ManagedService, error) {
+	svc := r.runner.findService(name)
+	if svc == nil {
+		return domain.ManagedService{}, fmt.Errorf("service %q not found", name)
+	}
+	status := r.runner.store.Get(name)
+	if status == nil {
+		return domain.ManagedService{}, fmt.Errorf("service %q not found", name)
+	}
+	return domain.NewManagedService(svc.Name, status.Group, string(status.Status), svc.DependsOn)
+}
+
+func (r *runnerRuntimeContextRepository) Save(service domain.ManagedService) error {
+	r.runner.store.Update(service.Name, Status(service.Status), "")
+	return nil
+}
+
+func (r *runnerRuntimeContextRepository) ListByGroup(groupName string) ([]domain.ManagedService, error) {
+	var result []domain.ManagedService
+	for _, group := range r.runner.cfg.Groups {
+		if group.Name != groupName {
+			continue
+		}
+		for _, svc := range group.Services {
+			status := r.runner.store.Get(svc.Name)
+			if status == nil {
+				continue
+			}
+			managed, err := domain.NewManagedService(svc.Name, group.Name, string(status.Status), svc.DependsOn)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, managed)
+		}
+	}
+	return result, nil
+}
+
+func (r *runnerRuntimeContextRepository) ListAll() ([]domain.ManagedService, error) {
+	services := r.runner.cfg.Flatten()
+	result := make([]domain.ManagedService, 0, len(services))
+	for _, svc := range services {
+		status := r.runner.store.Get(svc.Name)
+		if status == nil {
+			continue
+		}
+		managed, err := domain.NewManagedService(svc.Name, status.Group, string(status.Status), svc.DependsOn)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, managed)
+	}
+	return result, nil
+}
+
 func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 	cfg.fillDefaults()
 
@@ -43,6 +104,11 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 		store.SetURL(svc.Name, svc.HealthCheck.URL)
 		store.SetHealthPort(svc.Name, domain.ResolveHealthPort(svc.HealthCheck.URL))
 		store.SetCommandPort(svc.Name, domain.ResolveCommandPort(svc.Command))
+	}
+	for _, group := range cfg.Groups {
+		for _, svc := range group.Services {
+			store.SetGroup(svc.Name, group.Name)
+		}
 	}
 
 	// Build dependency status references
@@ -181,6 +247,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] stdout pipe: %w", svc.Name, err)
 		}
@@ -190,6 +257,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] stderr pipe: %w", svc.Name, err)
 		}
@@ -199,6 +267,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	if err := cmd.Start(); err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] failed to start: %w", svc.Name, err)
 		}
@@ -219,6 +288,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	err = waitHealthy(ctx, svc.HealthCheck)
 	if err != nil {
 		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		log.Printf("[%s] health check failed: %v", svc.Name, err)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] health check failed: %w", svc.Name, err)
@@ -278,8 +348,10 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 		return fmt.Errorf("service %q not found", name)
 	}
 
-	if !r.store.CompareAndSwapStatus(name, StatusHealthy, StatusRestarting) &&
-		!r.store.CompareAndSwapStatus(name, StatusFailed, StatusRestarting) {
+	previousStatus := StatusFailed
+	if r.store.CompareAndSwapStatus(name, StatusHealthy, StatusRestarting) {
+		previousStatus = StatusHealthy
+	} else if !r.store.CompareAndSwapStatus(name, StatusFailed, StatusRestarting) {
 		current := r.store.Get(name)
 		if current == nil {
 			return fmt.Errorf("service %q not found", name)
@@ -293,7 +365,7 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 		r.store.Update(name, StatusBuilding, "")
 		log.Printf("[%s] building...", name)
 		if err := r.runBuild(ctx, svc); err != nil {
-			r.store.Update(name, StatusFailed, err.Error())
+			r.store.Update(name, previousStatus, err.Error())
 			return err
 		}
 	}
@@ -304,11 +376,189 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 	// Start and health check
 	node := &ServiceNode{Service: *svc}
 	if err := r.startAndCheck(ctx, node); err != nil {
+		r.stopMonitoring(name)
+		r.stopProcess(name)
+		r.store.SetPID(name, 0)
+		return err
+	}
+	if err := r.ensureHealthyAfterManualStart(name); err != nil {
 		return err
 	}
 
 	// Resume continuous monitoring
 	r.startMonitoring(ctx, *svc)
+	return nil
+}
+
+func (r *Runner) StopService(ctx context.Context, name string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	svc := r.findService(name)
+	if svc == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+
+	current := r.store.Get(name)
+	if current == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	if current.Status == StatusStopped {
+		return nil
+	}
+
+	managedService, err := domain.NewManagedService(svc.Name, current.Group, string(current.Status), svc.DependsOn)
+	if err != nil {
+		return err
+	}
+	policyService := domain.NewServiceStopPolicyService(&runnerRuntimeContextRepository{runner: r})
+	decision, err := policyService.EvaluateStop(name)
+	if err != nil {
+		return err
+	}
+	activeDependents := mergeDependentNames(decision.ActiveDependents, r.runningDependents(name))
+	if err := managedService.CanStop(activeDependents); err != nil {
+		return err
+	}
+
+	r.stopMonitoring(name)
+	r.stopProcess(name)
+	r.store.SetPID(name, 0)
+	r.store.Update(name, StatusStopped, "")
+	r.store.UpdateDependencyStatus(name, StatusStopped)
+	return nil
+}
+
+func (r *Runner) StartService(ctx context.Context, name string) error {
+	svc := r.findService(name)
+	if svc == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	current := r.store.Get(name)
+	if current == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+
+	managedService, err := domain.NewManagedService(svc.Name, current.Group, string(current.Status), svc.DependsOn)
+	if err != nil {
+		return err
+	}
+	if !managedService.CanStart() {
+		return fmt.Errorf("service %q is %s, can only start stopped services", name, current.Status)
+	}
+
+	if !r.store.CompareAndSwapStatus(name, StatusStopped, StatusStarting) {
+		latest := r.store.Get(name)
+		if latest == nil {
+			return fmt.Errorf("service %q not found", name)
+		}
+		return fmt.Errorf("service %q is %s, can only start stopped services", name, latest.Status)
+	}
+
+	node := &ServiceNode{Service: *svc}
+	if err := r.startAndCheck(ctx, node); err != nil {
+		r.stopMonitoring(name)
+		r.stopProcess(name)
+		r.store.SetPID(name, 0)
+		return err
+	}
+	if err := r.ensureHealthyAfterManualStart(name); err != nil {
+		return err
+	}
+
+	r.startMonitoring(ctx, *svc)
+	return nil
+}
+
+func (r *Runner) ensureHealthyAfterManualStart(name string) error {
+	current := r.store.Get(name)
+	if current == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	if current.Status == StatusHealthy {
+		return nil
+	}
+	r.stopMonitoring(name)
+	r.stopProcess(name)
+	r.store.SetPID(name, 0)
+	if current.Error != "" {
+		return fmt.Errorf("service %q failed to start: %s", name, current.Error)
+	}
+	return fmt.Errorf("service %q failed to start", name)
+}
+
+func (r *Runner) runningDependents(name string) []string {
+	var running []string
+	for _, svc := range r.cfg.Flatten() {
+		if !dependsOnService(svc.DependsOn, name) {
+			continue
+		}
+		status := r.store.Get(svc.Name)
+		if status != nil && status.PID > 0 {
+			running = append(running, svc.Name)
+		}
+	}
+	return running
+}
+
+func dependsOnService(dependsOn []string, name string) bool {
+	for _, dep := range dependsOn {
+		if strings.TrimSpace(dep) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeDependentNames(parts ...[]string) []string {
+	seen := make(map[string]struct{})
+	for _, list := range parts {
+		for _, item := range list {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			seen[item] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for item := range seen {
+		result = append(result, item)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (r *Runner) StopGroup(ctx context.Context, group string) error {
+	var groupServices []Service
+	for _, g := range r.cfg.Groups {
+		if g.Name == group {
+			groupServices = g.Services
+			break
+		}
+	}
+	if groupServices == nil {
+		return fmt.Errorf("group %q not found", group)
+	}
+
+	stopOrder, err := stopOrderForGroup(groupServices)
+	if err != nil {
+		return fmt.Errorf("group %q has invalid dependencies: %w", group, err)
+	}
+
+	for _, serviceName := range stopOrder {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := r.StopService(ctx, serviceName); err != nil {
+			return fmt.Errorf("stop group %q failed on %q: %w", group, serviceName, err)
+		}
+	}
 	return nil
 }
 
@@ -382,6 +632,56 @@ func (r *Runner) stopProcess(name string) {
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		cmd.Wait()
 	}
+}
+
+func stopOrderForGroup(services []Service) ([]string, error) {
+	if len(services) == 0 {
+		return nil, nil
+	}
+
+	servicesByName := make(map[string]Service, len(services))
+	for _, svc := range services {
+		servicesByName[svc.Name] = svc
+	}
+
+	visitState := make(map[string]int, len(services))
+	order := make([]string, 0, len(services))
+
+	var visit func(string) error
+	visit = func(name string) error {
+		switch visitState[name] {
+		case 1:
+			return fmt.Errorf("cyclic dependency detected at service %q", name)
+		case 2:
+			return nil
+		}
+
+		visitState[name] = 1
+		svc := servicesByName[name]
+		for _, dep := range svc.DependsOn {
+			if _, exists := servicesByName[dep]; !exists {
+				continue
+			}
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+		visitState[name] = 2
+		order = append(order, name)
+		return nil
+	}
+
+	for _, svc := range services {
+		if err := visit(svc.Name); err != nil {
+			return nil, err
+		}
+	}
+
+	stopOrder := make([]string, 0, len(order))
+	for i := len(order) - 1; i >= 0; i-- {
+		stopOrder = append(stopOrder, order[i])
+	}
+	return stopOrder, nil
 }
 
 func (r *Runner) runBuild(ctx context.Context, svc *Service) error {

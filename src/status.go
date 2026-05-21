@@ -17,10 +17,12 @@ const (
 	StatusSkipped  Status = "skipped"
 	StatusRestarting Status = "restarting"
 	StatusBuilding  Status = "building"
+	StatusStopped  Status = "stopped"
 )
 
 type ServiceStatus struct {
 	Name      string      `json:"name"`
+	Group     string      `json:"group"`
 	Status    Status      `json:"status"`
 	DependsOn []DepStatus `json:"depends_on"`
 	Command   string      `json:"command"`
@@ -99,6 +101,14 @@ func (s *StatusStore) SetCommand(name, command string) {
 	defer s.mu.Unlock()
 	if svc, ok := s.services[name]; ok {
 		svc.Command = command
+	}
+}
+
+func (s *StatusStore) SetGroup(name, group string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if svc, ok := s.services[name]; ok {
+		svc.Group = group
 	}
 }
 

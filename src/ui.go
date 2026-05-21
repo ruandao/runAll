@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -28,66 +29,29 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 	})
 
 	mux.HandleFunc("/api/restart", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		var body struct {
-			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSONError(w, "invalid json")
-			return
-		}
-		body.Name = strings.TrimSpace(body.Name)
-		if body.Name == "" {
-			writeJSONError(w, "name is required")
-			return
-		}
-		if runner == nil {
-			writeJSONError(w, "runner is required")
-			return
-		}
+		handleServiceAction(w, r, runner, "name", func(ctx context.Context, name string) error {
+			log.Printf("[api] restart request for %s", name)
+			return runner.RestartService(ctx, name)
+		})
+	})
 
-		log.Printf("[api] restart request for %s", body.Name)
-		if err := runner.RestartService(r.Context(), body.Name); err != nil {
-			writeJSONError(w, err.Error())
-			return
-		}
+	mux.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
+		handleServiceAction(w, r, runner, "name", runner.StopService)
+	})
 
-		writeJSON(w, map[string]string{"status": "ok"})
+	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
+		handleServiceAction(w, r, runner, "name", runner.StartService)
+	})
+
+	mux.HandleFunc("/api/stop-group", func(w http.ResponseWriter, r *http.Request) {
+		handleServiceAction(w, r, runner, "group", runner.StopGroup)
 	})
 
 	mux.HandleFunc("/api/build", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		if runner == nil {
-			writeJSONError(w, "runner is required")
-			return
-		}
-
-		var body struct {
-			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSONError(w, "invalid json")
-			return
-		}
-		body.Name = strings.TrimSpace(body.Name)
-		if body.Name == "" {
-			writeJSONError(w, "name is required")
-			return
-		}
-
-		log.Printf("[api] build request for %s", body.Name)
-		if err := runner.BuildService(r.Context(), body.Name); err != nil {
-			writeJSONError(w, err.Error())
-			return
-		}
-
-		writeJSON(w, map[string]string{"status": "ok"})
+		handleServiceAction(w, r, runner, "name", func(ctx context.Context, name string) error {
+			log.Printf("[api] build request for %s", name)
+			return runner.BuildService(ctx, name)
+		})
 	})
 
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +167,47 @@ func writeJSONErrorWithStatus(w http.ResponseWriter, status int, message string)
 	if err := json.NewEncoder(w).Encode(map[string]string{"error": message}); err != nil {
 		log.Printf("[ui] json encode error: %v", err)
 	}
+}
+
+func handleServiceAction(w http.ResponseWriter, r *http.Request, runner *Runner, fieldName string, action func(context.Context, string) error) {
+	if r.Method != http.MethodPost {
+		writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	body, err := readStringFieldFromJSON(r, fieldName)
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	if runner == nil {
+		writeJSONError(w, "runner is required")
+		return
+	}
+	if err := action(r.Context(), body); err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func readStringFieldFromJSON(r *http.Request, fieldName string) (string, error) {
+	var payload map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("invalid json")
+	}
+	raw, ok := payload[fieldName]
+	if !ok {
+		return "", fmt.Errorf("%s is required", fieldName)
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s is required", fieldName)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%s is required", fieldName)
+	}
+	return value, nil
 }
 
 func startUIServer(store *StatusStore, runner *Runner, port string) *http.Server {

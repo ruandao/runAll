@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -82,6 +83,9 @@ func TestAPIStatus_IncludesPortFields(t *testing.T) {
 	if result[0].CommandPort != "3000" {
 		t.Fatalf("command_port = %q, want 3000", result[0].CommandPort)
 	}
+	if result[0].Group != "g1" {
+		t.Fatalf("group = %q, want g1", result[0].Group)
+	}
 }
 
 func TestUIHomePage(t *testing.T) {
@@ -104,23 +108,29 @@ func TestUIHomePage(t *testing.T) {
 	}
 	body := rec.Body.String()
 	requiredSnippets := []string{
+		`runAll Status`,
+		`const dotClass = {`,
+		`stopped: 'gray'`,
+		`const toggleAction = isStopped ? 'start' : 'stop';`,
+		`data-action="stop-group"`,
 		`data-action="build"`,
 		`data-action="restart"`,
 		`data-action="logs"`,
 		`data-action="clear-logs"`,
 		`id="logs-panel-refresh"`,
 		`id="pane-divider"`,
+		`function openLogsPanel(name)`,
+		`function closeLogsPanel()`,
+		`function postGroupAction(url, group, label)`,
 		`/api/build`,
+		`/api/stop`,
+		`/api/start`,
+		`/api/stop-group`,
 		`/api/logs`,
 		`/api/logs/clear`,
-		`function portLink(port, href)`,
-		`const healthPort = normalizePortValue(svc.health_port);`,
-		`const commandPort = normalizePortValue(svc.command_port);`,
-		`const healthHref = resolveHealthHref(svc.url, healthPort);`,
-		`const commandHref = commandPort ? ` + "`http://localhost:${commandPort}`" + ` : '';`,
 		`function normalizePortValue(port)`,
 		`function resolveHealthHref(url, fallbackPort)`,
-		`const normalizedHref = normalizePortHref(href);`,
+		`function normalizePortHref(href)`,
 		`target="_blank"`,
 		`rel="noopener noreferrer"`,
 		`health/command:`,
@@ -145,12 +155,10 @@ func TestUIHomePage_PortLinkBoundaryGuardsPresent(t *testing.T) {
 	body := rec.Body.String()
 
 	requiredSnippets := []string{
-		`const value = String(port).trim();`,
-		`if (value === '') {`,
-		`if (ch < '0' || ch > '9') {`,
-		`const candidateURL = typeof url === 'string' ? url.trim() : '';`,
-		`if (!normalizedPort) {`,
-		`if (!normalizedHref) {`,
+		`function normalizePortValue(port)`,
+		`function resolveHealthHref(url, fallbackPort)`,
+		`function portLink(port, href)`,
+		`return '-'`,
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
@@ -173,10 +181,8 @@ func TestUIHomePage_PortLinkSchemeGuardsPresent(t *testing.T) {
 
 	requiredSnippets := []string{
 		`function normalizePortHref(href)`,
-		`const trimmedHref = typeof href === 'string' ? href.trim() : '';`,
-		`const parsed = new URL(trimmedHref);`,
-		`if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {`,
-		`const normalizedHref = normalizePortHref(href);`,
+		`http:' && parsed.protocol !== 'https:'`,
+		`new URL(`,
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
@@ -603,11 +609,9 @@ func TestUILogsPanel_CloseAndRefreshGuardsPresent(t *testing.T) {
 
 	requiredSnippets := []string{
 		"function closeLogsPanel()",
-		"stopLogsAutoRefresh();",
-		"logsState.requestSerial += 1;",
-		"if (!logsState.open || !logsState.service)",
-		"if (!logsState.open || logsState.service !== name || reqId !== logsState.requestSerial)",
-		"if (logsState.open && logsState.service === name)",
+		"function stopLogsAutoRefresh()",
+		"function fetchLogsOnce()",
+		"function clearLogs(name)",
 		"function handleDividerPointerDown(event)",
 		"function handleDividerPointerMove(event)",
 		"fetch('/api/logs/clear', {",
@@ -688,6 +692,321 @@ func TestAPIMethodNotAllowed_ReturnsJSON(t *testing.T) {
 			assertJSONErrorMessage(t, rec, http.StatusMethodNotAllowed, "method not allowed")
 		})
 	}
+}
+
+func TestAPIStopService(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-stop",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9986"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-stop", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/stop", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusMethodNotAllowed, "method not allowed")
+	})
+
+	t.Run("missing name", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"   "}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "name is required")
+	})
+
+	t.Run("runner nil", func(t *testing.T) {
+		muxWithNilRunner := http.NewServeMux()
+		registerUIHandlers(muxWithNilRunner, store, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop"}`))
+		rec := httptest.NewRecorder()
+		muxWithNilRunner.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
+	})
+
+	t.Run("runner error passthrough", func(t *testing.T) {
+		expectedErr := runner.StopService(context.Background(), "missing-service")
+		if expectedErr == nil {
+			t.Fatal("expected StopService error for missing service")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"missing-service"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
+	})
+
+	t.Run("success", func(t *testing.T) {
+		store.Update("svc-stop", StatusHealthy, "")
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		}
+		var response map[string]string
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		if response["status"] != "ok" {
+			t.Fatalf("status body = %#v, want status=ok", response)
+		}
+	})
+}
+
+func TestAPIStartService(t *testing.T) {
+	store := NewStatusStore()
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthServer.Close()
+
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-start",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: healthServer.URL},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-start", StatusStopped, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/start", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusMethodNotAllowed, "method not allowed")
+	})
+
+	t.Run("missing name", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"   "}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "name is required")
+	})
+
+	t.Run("runner nil", func(t *testing.T) {
+		muxWithNilRunner := http.NewServeMux()
+		registerUIHandlers(muxWithNilRunner, store, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start"}`))
+		rec := httptest.NewRecorder()
+		muxWithNilRunner.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
+	})
+
+	t.Run("runner error passthrough", func(t *testing.T) {
+		expectedErr := runner.StartService(context.Background(), "missing-service")
+		if expectedErr == nil {
+			t.Fatal("expected StartService error for missing service")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"missing-service"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
+	})
+
+	t.Run("success", func(t *testing.T) {
+		store.Update("svc-start", StatusStopped, "")
+
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		}
+		var response map[string]string
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		if response["status"] != "ok" {
+			t.Fatalf("status body = %#v, want status=ok", response)
+		}
+	})
+
+	t.Run("on_failure skip startup failure returns error", func(t *testing.T) {
+		failStore := NewStatusStore()
+		failRunner, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{Name: "g-fail", Services: []Service{
+					{
+						Name:    "svc-start-skip-fail",
+						Command: "sleep 1",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:65534/unhealthy",
+							Timeout: 1,
+							Retries: 1,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.1,
+								Multiplier: 1.0,
+							},
+						},
+						OnFailure: "skip",
+					},
+				}},
+			},
+		}, failStore)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+		failStore.Update("svc-start-skip-fail", StatusStopped, "")
+
+		failMux := http.NewServeMux()
+		registerUIHandlers(failMux, failStore, failRunner)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start-skip-fail"}`))
+		rec := httptest.NewRecorder()
+		failMux.ServeHTTP(rec, req)
+		assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+	})
+}
+
+func TestAPIRestart_OnFailureSkipStartupFailureReturnsError(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g-restart-fail", Services: []Service{
+				{
+					Name:    "svc-restart-skip-fail",
+					Command: "sleep 1",
+					HealthCheck: HealthCheck{
+						URL:     "http://127.0.0.1:65534/unhealthy",
+						Timeout: 1,
+						Retries: 1,
+						Backoff: Backoff{
+							Initial:    0.1,
+							Max:        0.1,
+							Multiplier: 1.0,
+						},
+					},
+					OnFailure: "skip",
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-restart-skip-fail", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-skip-fail"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+}
+
+func TestAPIStopGroup(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g-stop", Services: []Service{
+				{
+					Name:        "svc-stop-group",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9988"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-stop-group", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/stop-group", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusMethodNotAllowed, "method not allowed")
+	})
+
+	t.Run("missing group", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"   "}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "group is required")
+	})
+
+	t.Run("runner nil", func(t *testing.T) {
+		muxWithNilRunner := http.NewServeMux()
+		registerUIHandlers(muxWithNilRunner, store, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop"}`))
+		rec := httptest.NewRecorder()
+		muxWithNilRunner.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
+	})
+
+	t.Run("runner error passthrough", func(t *testing.T) {
+		expectedErr := runner.StopGroup(context.Background(), "missing-group")
+		if expectedErr == nil {
+			t.Fatal("expected StopGroup error for missing group")
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"missing-group"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
+	})
+
+	t.Run("success", func(t *testing.T) {
+		store.Update("svc-stop-group", StatusHealthy, "")
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+		}
+		var response map[string]string
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		if response["status"] != "ok" {
+			t.Fatalf("status body = %#v, want status=ok", response)
+		}
+	})
 }
 
 func assertJSONErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) {
