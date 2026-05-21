@@ -427,7 +427,6 @@ func streamOutput(reader io.Reader, name, stream string, repository domain.Servi
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		log.Printf("[%s] %s", name, line)
 		if repository != nil {
 			entry, err := domain.NewLogEntry(time.Now(), name, stream, line)
 			if err != nil {
