@@ -6,9 +6,11 @@
 <title>runAll Status</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; height: 100vh; overflow: hidden; }
   h1 { font-size: 18px; margin-bottom: 4px; color: #e0e0e0; }
-  .subtitle { font-size: 12px; color: #888; margin-bottom: 20px; }
+  .workspace { margin-top: 20px; display: flex; width: 100%; height: calc(100vh - 120px); min-height: 0; overflow: hidden; --logs-width: 38%; }
+  .services-pane { flex: 1 1 auto; min-width: 320px; min-height: 0; padding-right: 8px; overflow: auto; }
+  .subtitle { font-size: 12px; color: #888; margin-bottom: 12px; }
   .service { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 4px; background: #16213e; border-radius: 6px; }
   .service:hover { background: #1c2a4a; }
   .name { font-weight: 600; min-width: 140px; }
@@ -29,47 +31,56 @@
   .logs-btn { border-color: #7c3aed; color: #ddd6fe; }
   .clear-logs-btn { border-color: #b45309; color: #fed7aa; }
   .ports { font-size: 12px; color: #94a3b8; min-width: 120px; }
+  .port-link { color: #93c5fd; text-decoration: none; }
+  .port-link:hover { color: #bfdbfe; text-decoration: underline; }
   .error-msg { color: #ef4444; font-size: 12px; margin-left: 8px; }
   .last-checked { font-size: 11px; color: #555; margin-left: auto; }
   .level-header { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 6px 0; }
   .uptime { font-size: 12px; color: #888; margin-top: 20px; }
-  .logs-modal { position: fixed; inset: 0; background: rgba(7, 11, 24, 0.75); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 20; }
-  .logs-modal.open { display: flex; }
-  .logs-modal-content { width: min(940px, 100%); max-height: 85vh; background: #0f172a; border: 1px solid #334155; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
-  .logs-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #1e293b; font-size: 13px; }
-  .logs-modal-title { font-weight: 600; }
-  .logs-modal-meta { color: #94a3b8; font-size: 11px; }
-  .logs-modal-actions { display: inline-flex; gap: 8px; }
-  .logs-modal-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
-  .logs-modal-btn:hover { background: #1e293b; color: #fff; }
-  .logs-content { margin: 0; padding: 12px 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow: auto; color: #dbeafe; min-height: 280px; background: #020617; }
+  .pane-divider { display: none; width: 8px; margin: 0 4px; border-radius: 6px; background: #1e293b; cursor: col-resize; position: relative; }
+  .pane-divider::after { content: ''; position: absolute; left: 50%; top: 30%; transform: translateX(-50%); width: 2px; height: 40%; border-radius: 2px; background: #475569; }
+  .logs-panel { display: none; width: var(--logs-width); min-width: 320px; max-width: 75vw; min-height: 0; background: #0f172a; border: 1px solid #334155; border-radius: 8px; flex-direction: column; overflow: hidden; }
+  .workspace.logs-open .pane-divider { display: block; }
+  .workspace.logs-open .logs-panel { display: flex; }
+  .logs-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #1e293b; font-size: 13px; }
+  .logs-panel-title { font-weight: 600; }
+  .logs-panel-meta { color: #94a3b8; font-size: 11px; }
+  .logs-panel-actions { display: inline-flex; gap: 8px; }
+  .logs-panel-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
+  .logs-panel-btn:hover { background: #1e293b; color: #fff; }
+  .logs-content { margin: 0; padding: 12px 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow: auto; color: #dbeafe; min-height: 280px; flex: 1 1 auto; background: #020617; }
   .logs-placeholder { color: #94a3b8; }
 </style>
 </head>
 <body>
 <h1>runAll Status</h1>
-<div class="subtitle">auto-refresh every 2s</div>
-<div id="services"></div>
-<div class="uptime" id="uptime"></div>
-<div id="logs-modal" class="logs-modal" aria-hidden="true">
-  <div class="logs-modal-content" role="dialog" aria-modal="true" aria-labelledby="logs-modal-title">
-    <div class="logs-modal-header">
+<div id="workspace" class="workspace">
+  <section class="services-pane">
+    <div class="subtitle">auto-refresh every 2s</div>
+    <div id="services"></div>
+    <div class="uptime" id="uptime"></div>
+  </section>
+  <div id="pane-divider" class="pane-divider" role="separator" aria-orientation="vertical" aria-label="Resize panels"></div>
+  <aside id="logs-panel" class="logs-panel" aria-hidden="true" aria-labelledby="logs-panel-title">
+    <div class="logs-panel-header">
       <div>
-        <div id="logs-modal-title" class="logs-modal-title">Service Logs</div>
-        <div id="logs-modal-meta" class="logs-modal-meta">last 200 lines, auto-refresh every 2s</div>
+        <div id="logs-panel-title" class="logs-panel-title">Service Logs</div>
+        <div id="logs-panel-meta" class="logs-panel-meta">last 200 lines, auto-refresh every 2s</div>
       </div>
-      <div class="logs-modal-actions">
-        <button id="logs-modal-refresh" class="logs-modal-btn" type="button">Refresh</button>
-        <button id="logs-modal-close" class="logs-modal-btn" type="button">Close</button>
+      <div class="logs-panel-actions">
+        <button id="logs-panel-refresh" class="logs-panel-btn" type="button">Refresh</button>
+        <button id="logs-panel-close" class="logs-panel-btn" type="button">Close</button>
       </div>
     </div>
     <pre id="logs-content" class="logs-content logs-placeholder">Select a service to view logs.</pre>
-  </div>
+  </aside>
 </div>
 <script>
 const startTime = Date.now();
 const statusRefreshMs = 2000;
 const logLines = 200;
+const minLogsPanelWidth = 320;
+const minServicePanelWidth = 380;
 const dotClass = {
   healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
   pending: 'gray', failed: 'red', skipped: 'dark'
@@ -79,6 +90,9 @@ const logsState = {
   service: '',
   timerId: null,
   requestSerial: 0,
+};
+const layoutState = {
+  resizing: false,
 };
 
 async function refresh() {
@@ -101,11 +115,15 @@ async function refresh() {
     html += `<div class="level-header">Level ${depth}</div>`;
     for (const svc of services) {
       const cls = dotClass[svc.status] || 'gray';
+      const healthPort = normalizePortValue(svc.health_port);
+      const commandPort = normalizePortValue(svc.command_port);
+      const healthHref = resolveHealthHref(svc.url, healthPort);
+      const commandHref = commandPort ? `http://localhost:${commandPort}` : '';
       html += `<div class="service">`;
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
       html += `<span class="status">${svc.status}</span>`;
-      html += `<span class="ports">health/command: ${esc(svc.health_port || '-')} / ${esc(svc.command_port || '-')}</span>`;
+      html += `<span class="ports">health/command: ${portLink(healthPort, healthHref)} / ${portLink(commandPort, commandHref)}</span>`;
       html += `<span class="actions">`;
       html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
       html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}">重启</button>`;
@@ -187,13 +205,14 @@ async function postServiceAction(url, name, label) {
   }
 }
 
-function openLogsModal(name) {
+function openLogsPanel(name) {
   logsState.open = true;
   logsState.service = name;
   logsState.requestSerial += 1;
-  const modal = document.getElementById('logs-modal');
-  modal.classList.add('open');
-  modal.setAttribute('aria-hidden', 'false');
+  const workspace = document.getElementById('workspace');
+  workspace.classList.add('logs-open');
+  const panel = document.getElementById('logs-panel');
+  panel.setAttribute('aria-hidden', 'false');
   updateLogsMeta('loading...');
   document.getElementById('logs-content').textContent = 'Loading logs...';
   stopLogsAutoRefresh();
@@ -201,14 +220,15 @@ function openLogsModal(name) {
   logsState.timerId = setInterval(fetchLogsOnce, statusRefreshMs);
 }
 
-function closeLogsModal() {
+function closeLogsPanel() {
   logsState.open = false;
   logsState.service = '';
   logsState.requestSerial += 1;
   stopLogsAutoRefresh();
-  const modal = document.getElementById('logs-modal');
-  modal.classList.remove('open');
-  modal.setAttribute('aria-hidden', 'true');
+  const workspace = document.getElementById('workspace');
+  workspace.classList.remove('logs-open');
+  const panel = document.getElementById('logs-panel');
+  panel.setAttribute('aria-hidden', 'true');
 }
 
 function stopLogsAutoRefresh() {
@@ -250,7 +270,7 @@ function renderLogs(payload) {
   const content = document.getElementById('logs-content');
   content.textContent = rows.length > 0 ? rows.join('\n') : 'No logs available.';
   updateLogsMeta(`${rows.length} lines - refreshed at ${formatNowTime()}`);
-  document.getElementById('logs-modal-title').textContent = `${name} logs`;
+  document.getElementById('logs-panel-title').textContent = `${name} logs`;
 }
 
 function normalizeLogRows(lines) {
@@ -280,7 +300,7 @@ async function parseJsonSafe(resp) {
 }
 
 function updateLogsMeta(text) {
-  document.getElementById('logs-modal-meta').textContent = `${logsState.service || '-'} - ${text} - last ${logLines} lines`;
+  document.getElementById('logs-panel-meta').textContent = `${logsState.service || '-'} - ${text} - last ${logLines} lines`;
 }
 
 function formatNowTime() {
@@ -312,6 +332,95 @@ function esc(s) {
   return el.innerHTML;
 }
 
+function normalizePortValue(port) {
+  if (port === undefined || port === null) {
+    return '';
+  }
+  const value = String(port).trim();
+  if (value === '') {
+    return '';
+  }
+  for (const ch of value) {
+    if (ch < '0' || ch > '9') {
+      return '';
+    }
+  }
+  return value;
+}
+
+function resolveHealthHref(url, fallbackPort) {
+  const candidateURL = typeof url === 'string' ? url.trim() : '';
+  if (candidateURL) {
+    return candidateURL;
+  }
+  if (!fallbackPort) {
+    return '';
+  }
+  return `http://localhost:${fallbackPort}`;
+}
+
+function normalizePortHref(href) {
+  const trimmedHref = typeof href === 'string' ? href.trim() : '';
+  if (!trimmedHref) {
+    return '';
+  }
+  try {
+    const parsed = new URL(trimmedHref);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    return parsed.href;
+  } catch (_) {
+    return '';
+  }
+}
+
+function portLink(port, href) {
+  const normalizedPort = normalizePortValue(port);
+  if (!normalizedPort) {
+    return '-';
+  }
+  const normalizedHref = normalizePortHref(href);
+  if (!normalizedHref) {
+    return esc(normalizedPort);
+  }
+  return `<a class="port-link" href="${esc(normalizedHref)}" target="_blank" rel="noopener noreferrer">${esc(normalizedPort)}</a>`;
+}
+
+function setLogsPanelWidth(px) {
+  const workspace = document.getElementById('workspace');
+  const maxWidth = Math.max(minLogsPanelWidth, workspace.clientWidth - minServicePanelWidth - 16);
+  const clamped = Math.min(Math.max(px, minLogsPanelWidth), maxWidth);
+  workspace.style.setProperty('--logs-width', `${clamped}px`);
+}
+
+function handleDividerPointerDown(event) {
+  if (!logsState.open) {
+    return;
+  }
+  layoutState.resizing = true;
+  event.preventDefault();
+  document.body.style.cursor = 'col-resize';
+}
+
+function handleDividerPointerMove(event) {
+  if (!layoutState.resizing || !logsState.open) {
+    return;
+  }
+  const workspace = document.getElementById('workspace');
+  const rect = workspace.getBoundingClientRect();
+  const newWidth = rect.right - event.clientX;
+  setLogsPanelWidth(newWidth);
+}
+
+function handleDividerPointerUp() {
+  if (!layoutState.resizing) {
+    return;
+  }
+  layoutState.resizing = false;
+  document.body.style.cursor = '';
+}
+
 document.getElementById('services').addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-action][data-name]');
   if (!btn) {
@@ -331,7 +440,7 @@ document.getElementById('services').addEventListener('click', (event) => {
     return;
   }
   if (action === 'logs') {
-    openLogsModal(name);
+    openLogsPanel(name);
     return;
   }
   if (action === 'clear-logs') {
@@ -339,16 +448,22 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
 });
 
-document.getElementById('logs-modal-close').addEventListener('click', closeLogsModal);
-document.getElementById('logs-modal-refresh').addEventListener('click', fetchLogsOnce);
-document.getElementById('logs-modal').addEventListener('click', (event) => {
-  if (event.target.id === 'logs-modal') {
-    closeLogsModal();
-  }
-});
+document.getElementById('logs-panel-close').addEventListener('click', closeLogsPanel);
+document.getElementById('logs-panel-refresh').addEventListener('click', fetchLogsOnce);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && logsState.open) {
-    closeLogsModal();
+    closeLogsPanel();
+  }
+});
+document.getElementById('pane-divider').addEventListener('mousedown', handleDividerPointerDown);
+window.addEventListener('mousemove', handleDividerPointerMove);
+window.addEventListener('mouseup', handleDividerPointerUp);
+window.addEventListener('blur', handleDividerPointerUp);
+window.addEventListener('resize', () => {
+  const workspace = document.getElementById('workspace');
+  const currentWidth = parseFloat(workspace.style.getPropertyValue('--logs-width'));
+  if (!Number.isNaN(currentWidth)) {
+    setLogsPanelWidth(currentWidth);
   }
 });
 

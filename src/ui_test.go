@@ -108,17 +108,79 @@ func TestUIHomePage(t *testing.T) {
 		`data-action="restart"`,
 		`data-action="logs"`,
 		`data-action="clear-logs"`,
-		`id="logs-modal-refresh"`,
+		`id="logs-panel-refresh"`,
+		`id="pane-divider"`,
 		`/api/build`,
 		`/api/logs`,
 		`/api/logs/clear`,
-		`svc.health_port || '-'`,
-		`svc.command_port || '-'`,
+		`function portLink(port, href)`,
+		`const healthPort = normalizePortValue(svc.health_port);`,
+		`const commandPort = normalizePortValue(svc.command_port);`,
+		`const healthHref = resolveHealthHref(svc.url, healthPort);`,
+		`const commandHref = commandPort ? ` + "`http://localhost:${commandPort}`" + ` : '';`,
+		`function normalizePortValue(port)`,
+		`function resolveHealthHref(url, fallbackPort)`,
+		`const normalizedHref = normalizePortHref(href);`,
+		`target="_blank"`,
+		`rel="noopener noreferrer"`,
 		`health/command:`,
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
 			t.Fatalf("home page missing required snippet %q", snippet)
+		}
+	}
+}
+
+func TestUIHomePage_PortLinkBoundaryGuardsPresent(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, nil)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	requiredSnippets := []string{
+		`const value = String(port).trim();`,
+		`if (value === '') {`,
+		`if (ch < '0' || ch > '9') {`,
+		`const candidateURL = typeof url === 'string' ? url.trim() : '';`,
+		`if (!normalizedPort) {`,
+		`if (!normalizedHref) {`,
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(body, snippet) {
+			t.Fatalf("status.html missing port boundary snippet %q", snippet)
+		}
+	}
+}
+
+func TestUIHomePage_PortLinkSchemeGuardsPresent(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, nil)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	requiredSnippets := []string{
+		`function normalizePortHref(href)`,
+		`const trimmedHref = typeof href === 'string' ? href.trim() : '';`,
+		`const parsed = new URL(trimmedHref);`,
+		`if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {`,
+		`const normalizedHref = normalizePortHref(href);`,
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(body, snippet) {
+			t.Fatalf("status.html missing port href scheme guard snippet %q", snippet)
 		}
 	}
 }
@@ -527,7 +589,7 @@ func TestAPILogs_TooLargeLinesRejected(t *testing.T) {
 	assertJSONErrorMessage(t, rec, http.StatusBadRequest, "lines must be <= 2000")
 }
 
-func TestUILogsModal_CloseAndRefreshGuardsPresent(t *testing.T) {
+func TestUILogsPanel_CloseAndRefreshGuardsPresent(t *testing.T) {
 	store := NewStatusStore()
 	store.Init([]string{"svc"})
 
@@ -540,12 +602,14 @@ func TestUILogsModal_CloseAndRefreshGuardsPresent(t *testing.T) {
 	body := rec.Body.String()
 
 	requiredSnippets := []string{
-		"function closeLogsModal()",
+		"function closeLogsPanel()",
 		"stopLogsAutoRefresh();",
 		"logsState.requestSerial += 1;",
 		"if (!logsState.open || !logsState.service)",
 		"if (!logsState.open || logsState.service !== name || reqId !== logsState.requestSerial)",
 		"if (logsState.open && logsState.service === name)",
+		"function handleDividerPointerDown(event)",
+		"function handleDividerPointerMove(event)",
 		"fetch('/api/logs/clear', {",
 	}
 	for _, snippet := range requiredSnippets {
