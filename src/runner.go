@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -351,12 +352,18 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 	previousStatus := StatusFailed
 	if r.store.CompareAndSwapStatus(name, StatusHealthy, StatusRestarting) {
 		previousStatus = StatusHealthy
-	} else if !r.store.CompareAndSwapStatus(name, StatusFailed, StatusRestarting) {
+	} else if r.store.CompareAndSwapStatus(name, StatusFailed, StatusRestarting) {
+		previousStatus = StatusFailed
+	} else if r.store.CompareAndSwapStatus(name, StatusStopped, StatusRestarting) {
+		previousStatus = StatusStopped
+	} else if r.store.CompareAndSwapStatus(name, StatusPending, StatusRestarting) {
+		previousStatus = StatusPending
+	} else {
 		current := r.store.Get(name)
 		if current == nil {
 			return fmt.Errorf("service %q not found", name)
 		}
-		return fmt.Errorf("service %q is %s, can only restart healthy or failed services", name, current.Status)
+		return fmt.Errorf("service %q is %s, can only restart healthy, failed, stopped, or pending services", name, current.Status)
 	}
 	r.stopMonitoring(name)
 
@@ -371,13 +378,13 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 	}
 
 	// Stop existing process
-	r.stopProcess(name)
+	_ = r.stopProcess(name)
 
 	// Start and health check
 	node := &ServiceNode{Service: *svc}
 	if err := r.startAndCheck(ctx, node); err != nil {
 		r.stopMonitoring(name)
-		r.stopProcess(name)
+		_ = r.stopProcess(name)
 		r.store.SetPID(name, 0)
 		return err
 	}
@@ -425,7 +432,15 @@ func (r *Runner) StopService(ctx context.Context, name string) error {
 	}
 
 	r.stopMonitoring(name)
-	r.stopProcess(name)
+	hadTrackedProcess := r.stopProcess(name)
+
+	if !hadTrackedProcess {
+		if err := r.ensureServiceNotReachable(svc); err != nil {
+			r.store.Update(name, StatusFailed, err.Error())
+			return err
+		}
+	}
+
 	r.store.SetPID(name, 0)
 	r.store.Update(name, StatusStopped, "")
 	r.store.UpdateDependencyStatus(name, StatusStopped)
@@ -461,7 +476,7 @@ func (r *Runner) StartService(ctx context.Context, name string) error {
 	node := &ServiceNode{Service: *svc}
 	if err := r.startAndCheck(ctx, node); err != nil {
 		r.stopMonitoring(name)
-		r.stopProcess(name)
+		_ = r.stopProcess(name)
 		r.store.SetPID(name, 0)
 		return err
 	}
@@ -482,7 +497,7 @@ func (r *Runner) ensureHealthyAfterManualStart(name string) error {
 		return nil
 	}
 	r.stopMonitoring(name)
-	r.stopProcess(name)
+	_ = r.stopProcess(name)
 	r.store.SetPID(name, 0)
 	if current.Error != "" {
 		return fmt.Errorf("service %q failed to start: %s", name, current.Error)
@@ -574,12 +589,16 @@ func (r *Runner) BuildService(ctx context.Context, name string) error {
 	previousStatus := StatusFailed
 	if r.store.CompareAndSwapStatus(name, StatusHealthy, StatusBuilding) {
 		previousStatus = StatusHealthy
-	} else if !r.store.CompareAndSwapStatus(name, StatusFailed, StatusBuilding) {
+	} else if r.store.CompareAndSwapStatus(name, StatusFailed, StatusBuilding) {
+		previousStatus = StatusFailed
+	} else if r.store.CompareAndSwapStatus(name, StatusStopped, StatusBuilding) {
+		previousStatus = StatusStopped
+	} else {
 		current := r.store.Get(name)
 		if current == nil {
 			return fmt.Errorf("service %q not found", name)
 		}
-		return fmt.Errorf("service %q is %s, can only build healthy or failed services", name, current.Status)
+		return fmt.Errorf("service %q is %s, can only build healthy, failed, or stopped services", name, current.Status)
 	}
 
 	log.Printf("[%s] build-only requested", name)
@@ -604,7 +623,7 @@ func (r *Runner) findService(name string) *Service {
 	return nil
 }
 
-func (r *Runner) stopProcess(name string) {
+func (r *Runner) stopProcess(name string) bool {
 	r.mu.Lock()
 	cmd, ok := r.processes[name]
 	if ok {
@@ -613,7 +632,7 @@ func (r *Runner) stopProcess(name string) {
 	r.mu.Unlock()
 
 	if !ok || cmd == nil || cmd.Process == nil {
-		return
+		return false
 	}
 
 	log.Printf("[%s] restarting: sending SIGTERM", name)
@@ -632,6 +651,111 @@ func (r *Runner) stopProcess(name string) {
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		cmd.Wait()
 	}
+	return true
+}
+
+func (r *Runner) ensureServiceNotReachable(svc *Service) error {
+	if svc == nil {
+		return fmt.Errorf("service is required")
+	}
+	if checkHealth(context.Background(), svc.HealthCheck.URL) != nil {
+		return nil
+	}
+
+	ports := resolveServicePorts(svc)
+	if len(ports) == 0 {
+		return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.URL)
+	}
+
+	for _, port := range ports {
+		if err := terminateListenersByPort(port); err != nil {
+			log.Printf("[%s] stop fallback on port %s failed: %v", svc.Name, port, err)
+		}
+		if checkHealth(context.Background(), svc.HealthCheck.URL) != nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.URL)
+}
+
+func resolveServicePorts(svc *Service) []string {
+	seen := map[string]struct{}{}
+	var ports []string
+
+	for _, candidate := range []string{
+		domain.ResolveHealthPort(svc.HealthCheck.URL),
+		domain.ResolveCommandPort(svc.Command),
+	} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ports = append(ports, candidate)
+	}
+
+	return ports
+}
+
+func terminateListenersByPort(port string) error {
+	pids, err := listenerPIDs(port)
+	if err != nil {
+		return err
+	}
+	if len(pids) == 0 {
+		return nil
+	}
+
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	remaining := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, 0); err == nil {
+			remaining = append(remaining, pid)
+		}
+	}
+	for _, pid := range remaining {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+
+	return nil
+}
+
+func listenerPIDs(port string) ([]int, error) {
+	if strings.TrimSpace(port) == "" {
+		return nil, nil
+	}
+
+	cmd := exec.Command("lsof", "-t", "-iTCP:"+port, "-sTCP:LISTEN")
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list listeners on port %s: %w", port, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	pids := make([]int, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid, convErr := strconv.Atoi(line)
+		if convErr != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
 }
 
 func stopOrderForGroup(services []Service) ([]string, error) {

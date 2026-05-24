@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -186,6 +189,37 @@ func TestBuildService_Success(t *testing.T) {
 	}
 }
 
+func TestBuildService_SuccessWhenStopped(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "build-only-stopped",
+					BuildCommand: "echo built",
+					Command:      "echo running",
+					HealthCheck:  HealthCheck{URL: "http://localhost:9994"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.Update("build-only-stopped", StatusStopped, "")
+	err = runner.BuildService(context.Background(), "build-only-stopped")
+	if err != nil {
+		t.Fatalf("BuildService: unexpected error: %v", err)
+	}
+
+	status := store.Get("build-only-stopped")
+	if status == nil || status.Status != StatusStopped {
+		t.Fatalf("status = %#v, want stopped", status)
+	}
+}
+
 func TestBuildService_Failure(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
@@ -259,7 +293,7 @@ func TestBuildService_StatusConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected status conflict error")
 	}
-	if !strings.Contains(err.Error(), "can only build healthy or failed services") {
+	if !strings.Contains(err.Error(), "can only build healthy, failed, or stopped services") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -296,7 +330,7 @@ func TestBuildService_ConcurrentBuildRejected(t *testing.T) {
 	if secondErr == nil {
 		t.Fatal("expected second concurrent build to be rejected")
 	}
-	if !strings.Contains(secondErr.Error(), "can only build healthy or failed services") {
+	if !strings.Contains(secondErr.Error(), "can only build healthy, failed, or stopped services") {
 		t.Fatalf("unexpected second error: %v", secondErr)
 	}
 
@@ -410,7 +444,33 @@ func TestRestartService_WithBuildCommand_FailureKeepsPreviousStatus(t *testing.T
 	}
 }
 
-func TestRestartService_NotHealthyOrFailed(t *testing.T) {
+func TestRestartService_StoppedServiceAllowed(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "stopped-svc",
+					Command:     "echo hi",
+					HealthCheck: HealthCheck{URL: "http://localhost:9993"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("stopped-svc", StatusStopped, "")
+
+	ctx := context.Background()
+	err = runner.RestartService(ctx, "stopped-svc")
+	if err != nil && strings.Contains(err.Error(), "can only restart healthy, failed, stopped, or pending services") {
+		t.Fatalf("stopped service should be restartable, got: %v", err)
+	}
+}
+
+func TestRestartService_PendingServiceAllowed(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
 		Version: "1",
@@ -427,10 +487,12 @@ func TestRestartService_NotHealthyOrFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
+	store.Update("pending-svc", StatusPending, "")
+
 	ctx := context.Background()
 	err = runner.RestartService(ctx, "pending-svc")
-	if err == nil {
-		t.Fatal("expected error for non-healthy/non-failed service")
+	if err != nil && strings.Contains(err.Error(), "can only restart healthy, failed, stopped, or pending services") {
+		t.Fatalf("pending service should be restartable, got: %v", err)
 	}
 }
 
@@ -685,6 +747,71 @@ func TestRunner_StopService_ClearsPID(t *testing.T) {
 	}
 	if status.PID != 0 {
 		t.Fatalf("pid = %d, want 0", status.PID)
+	}
+}
+
+func TestRunner_StopService_StopsDetachedListenerByPortFallback(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "detached-listener",
+						Command: "echo managed-externally",
+						HealthCheck: HealthCheck{
+							URL:     healthURL,
+							Timeout: 5,
+							Retries: 10,
+							Backoff: Backoff{
+								Initial:    0.1,
+								Max:        0.2,
+								Multiplier: 1.2,
+							},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	pid := startDetachedHTTPServer(t, port)
+	defer func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}()
+	waitForPortOpen(t, port, 5*time.Second)
+
+	store.Update("detached-listener", StatusHealthy, "")
+	store.SetPID("detached-listener", 0)
+
+	if _, exists := runner.processes["detached-listener"]; exists {
+		t.Fatal("test setup expects no tracked process entry")
+	}
+
+	if err := runner.StopService(context.Background(), "detached-listener"); err != nil {
+		t.Fatalf("StopService: %v", err)
+	}
+
+	waitForPortClosed(t, port, 5*time.Second)
+	status := store.Get("detached-listener")
+	if status == nil || status.Status != StatusStopped {
+		t.Fatalf("status = %#v, want stopped", status)
 	}
 }
 
@@ -1086,6 +1213,49 @@ func waitForStatus(t *testing.T, store *StatusStore, name string, want Status, t
 		t.Fatalf("timed out waiting for status %q: service %q not found", want, name)
 	}
 	t.Fatalf("timed out waiting for status %q, got %q", want, got.Status)
+}
+
+func waitForPortClosed(t *testing.T, port int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 150*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("port %d still open after %s", port, timeout)
+}
+
+func waitForPortOpen(t *testing.T, port int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 150*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("port %d did not open within %s", port, timeout)
+}
+
+func startDetachedHTTPServer(t *testing.T, port int) int {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("nohup python3 -m http.server %d >/dev/null 2>&1 & echo $!", port))
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("start detached server: %v", err)
+	}
+	pidText := strings.TrimSpace(string(output))
+	pid, err := strconv.Atoi(pidText)
+	if err != nil {
+		t.Fatalf("parse detached pid %q: %v", pidText, err)
+	}
+	return pid
 }
 
 func TestMonitor_DetectsUnhealthy(t *testing.T) {
