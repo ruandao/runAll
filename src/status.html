@@ -24,8 +24,22 @@
   .dot.red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
   .dot.dark { background: #374151; }
   .actions { display: inline-flex; gap: 6px; margin-left: 8px; }
-  .action-btn { border: 1px solid #555; color: #ccc; cursor: pointer; font-size: 12px; padding: 3px 8px; border-radius: 4px; background: #111827; }
-  .action-btn:hover { background: #1f2937; color: #fff; border-color: #888; }
+  .action-btn {
+    border: 1px solid #555;
+    color: #ccc;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: #111827;
+    user-select: none;
+    transition: transform 90ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 140ms ease, filter 140ms ease;
+    box-shadow: 0 1px 0 rgba(15, 23, 42, 0.75);
+  }
+  .action-btn:hover { background: #273449; color: #fff; border-color: #9ca3af; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.55); }
+  .action-btn:active { transform: translateY(1px) scale(0.98); filter: brightness(1.12); box-shadow: 0 0 0 rgba(15, 23, 42, 0.2); }
+  .action-btn.is-clicked { filter: brightness(1.18); box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.65), 0 0 10px rgba(148, 163, 184, 0.45); }
+  .action-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
   .build-btn { border-color: #4b5563; color: #d1d5db; }
   .restart-btn { border-color: #1d4ed8; color: #bfdbfe; }
   .logs-btn { border-color: #7c3aed; color: #ddd6fe; }
@@ -46,8 +60,21 @@
   .logs-panel-title { font-weight: 600; }
   .logs-panel-meta { color: #94a3b8; font-size: 11px; }
   .logs-panel-actions { display: inline-flex; gap: 8px; }
-  .logs-panel-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
-  .logs-panel-btn:hover { background: #1e293b; color: #fff; }
+  .logs-panel-btn {
+    background: transparent;
+    border: 1px solid #475569;
+    color: #cbd5e1;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+    transition: transform 90ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 140ms ease, filter 140ms ease;
+    box-shadow: 0 1px 0 rgba(15, 23, 42, 0.75);
+  }
+  .logs-panel-btn:hover { background: #334155; border-color: #64748b; color: #fff; box-shadow: 0 2px 8px rgba(2, 6, 23, 0.5); }
+  .logs-panel-btn:active { transform: translateY(1px) scale(0.98); filter: brightness(1.12); box-shadow: 0 0 0 rgba(2, 6, 23, 0.2); }
+  .logs-panel-btn.is-clicked { filter: brightness(1.18); box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.65), 0 0 10px rgba(148, 163, 184, 0.45); }
+  .logs-panel-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
   .logs-content { margin: 0; padding: 12px 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow: auto; color: #dbeafe; min-height: 280px; flex: 1 1 auto; background: #020617; }
   .logs-placeholder { color: #94a3b8; }
 </style>
@@ -81,6 +108,7 @@ const statusRefreshMs = 2000;
 const logLines = 200;
 const minLogsPanelWidth = 320;
 const minServicePanelWidth = 380;
+const clickFeedbackDurationMs = 160;
 const dotClass = {
   healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
   pending: 'gray', stopped: 'gray', failed: 'red', skipped: 'dark'
@@ -94,6 +122,26 @@ const logsState = {
 const layoutState = {
   resizing: false,
 };
+const clickFeedbackTimers = new WeakMap();
+
+function pulseClickFeedback(buttonEl) {
+  if (!buttonEl) {
+    return;
+  }
+  const oldTimer = clickFeedbackTimers.get(buttonEl);
+  if (oldTimer) {
+    clearTimeout(oldTimer);
+  }
+  buttonEl.classList.remove('is-clicked');
+  // Force a reflow so fast repeated clicks still retrigger the animation.
+  void buttonEl.offsetWidth;
+  buttonEl.classList.add('is-clicked');
+  const timerId = setTimeout(() => {
+    buttonEl.classList.remove('is-clicked');
+    clickFeedbackTimers.delete(buttonEl);
+  }, clickFeedbackDurationMs);
+  clickFeedbackTimers.set(buttonEl, timerId);
+}
 
 async function refresh() {
   try {
@@ -473,6 +521,7 @@ document.getElementById('services').addEventListener('click', (event) => {
   if (!btn) {
     return;
   }
+  pulseClickFeedback(btn);
   const action = btn.getAttribute('data-action');
   const name = btn.getAttribute('data-name');
   const group = btn.getAttribute('data-group');
@@ -509,8 +558,14 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
 });
 
-document.getElementById('logs-panel-close').addEventListener('click', closeLogsPanel);
-document.getElementById('logs-panel-refresh').addEventListener('click', fetchLogsOnce);
+document.getElementById('logs-panel-close').addEventListener('click', (event) => {
+  pulseClickFeedback(event.currentTarget);
+  closeLogsPanel();
+});
+document.getElementById('logs-panel-refresh').addEventListener('click', (event) => {
+  pulseClickFeedback(event.currentTarget);
+  fetchLogsOnce();
+});
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && logsState.open) {
     closeLogsPanel();
