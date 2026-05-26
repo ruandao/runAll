@@ -38,3 +38,25 @@ type ServiceBecameHealthy struct {
 	SessionID   string
 	OccurredAt  time.Time
 }
+
+type PortConflictCleanupAttempted struct {
+	ServiceName string
+	Port        string
+	ForeignPIDs []int
+	OccurredAt  time.Time
+}
+
+type PortConflictCleanupSucceeded struct {
+	ServiceName    string
+	Port           string
+	TerminatedPIDs []int
+	OccurredAt     time.Time
+}
+
+type PortConflictCleanupFailed struct {
+	ServiceName          string
+	Port                 string
+	RemainingForeignPIDs []int
+	Hint                 string
+	OccurredAt           time.Time
+}

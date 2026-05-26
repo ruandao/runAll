@@ -52,6 +52,15 @@ func (s deleteOwnershipFailingRepositoryStub) ListAll() ([]domain.ServiceOwnersh
 	return s.delegate.ListAll()
 }
 
+func stubNoPortListenersForTest(runner *Runner) {
+	if runner == nil {
+		return
+	}
+	runner.listenerPIDsFn = func(string) ([]int, error) {
+		return nil, nil
+	}
+}
+
 func TestRunBuild_Success(t *testing.T) {
 	runner := &Runner{}
 	svc := &Service{
@@ -1740,6 +1749,7 @@ func TestRunner_StartService_FromStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
+	stubNoPortListenersForTest(runner)
 	store.Update("startable", StatusStopped, "")
 
 	if err := runner.StartService(context.Background(), "startable"); err != nil {
@@ -1803,6 +1813,7 @@ func TestRunner_StartServiceWithActor_EstablishesOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
+	stubNoPortListenersForTest(runner)
 	store.Update("start-with-actor", StatusStopped, "")
 
 	if err := runner.StartServiceWithActor(context.Background(), "start-with-actor", "ui-session-1"); err != nil {
@@ -1901,6 +1912,7 @@ func TestRunner_StartServiceWithActor_AllowsNonOwnerAfterOwnerStops(t *testing.T
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
+	stubNoPortListenersForTest(runner)
 	store.Update("start-reacquire", StatusStopped, "")
 
 	if err := runner.StartServiceWithActor(context.Background(), "start-reacquire", "owner-session"); err != nil {
@@ -2864,4 +2876,113 @@ func TestStartAndCheck_ContextCancellationNotClassifiedAsReadinessTimeout(t *tes
 
 		runner.stopProcess("ctx-deadline-svc")
 	})
+}
+
+func TestRunner_StartServiceWithActor_RunsPreflightBeforeLaunch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "preflight-before-launch",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("preflight-before-launch", StatusStopped, "")
+
+	preflightCalled := false
+	runner.preflightFn = func(ctx context.Context, svc Service) error {
+		preflightCalled = true
+		return nil
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "preflight-before-launch", "ui-session"); err != nil {
+		t.Fatalf("StartServiceWithActor: %v", err)
+	}
+	if !preflightCalled {
+		t.Fatal("expected preflight before manual launch")
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "preflight-before-launch", "ui-session"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor: %v", err)
+	}
+}
+
+func TestRunner_StartServiceWithActor_CleansForeignPortConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "platform",
+				Services: []Service{
+					{
+						Name:    "git-oauth",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("git-oauth", StatusStopped, "")
+
+	calls := 0
+	healthPort := domain.ResolveHealthPort(srv.URL)
+	runner.listenerPIDsFn = func(port string) ([]int, error) {
+		if port != healthPort {
+			return nil, nil
+		}
+		calls++
+		if calls == 1 {
+			return []int{8765}, nil
+		}
+		return nil, nil
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "git-oauth", "ui-session"); err != nil {
+		t.Fatalf("StartServiceWithActor after conflict cleanup: %v", err)
+	}
+
+	status := store.Get("git-oauth")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("expected healthy git-oauth, got %+v", status)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "git-oauth", "ui-session"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor: %v", err)
+	}
 }

@@ -296,6 +296,9 @@ func TestUIHomePage(t *testing.T) {
 		`data-action="logs"`,
 		`data-action="clear-logs"`,
 		`id="logs-panel-refresh"`,
+		`id="logs-panel-copy"`,
+		`async function copyLogsToClipboard()`,
+		`navigator.clipboard.writeText`,
 		`id="pane-divider"`,
 		`function openLogsPanel(name)`,
 		`function closeLogsPanel()`,
@@ -317,6 +320,29 @@ func TestUIHomePage(t *testing.T) {
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
 			t.Fatalf("home page missing required snippet %q", snippet)
+		}
+	}
+}
+
+func TestUIHomePage_LogCopyFailureFallbackPresent(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, nil)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	for _, snippet := range []string{
+		"function copyLogsToClipboard()",
+		"updateLogsMeta('copy failed",
+		"copied at",
+	} {
+		if !strings.Contains(body, snippet) {
+			t.Fatalf("status.html missing log copy snippet %q", snippet)
 		}
 	}
 }
@@ -1003,6 +1029,7 @@ func TestAPIStartService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
+	stubNoPortListenersForTest(runner)
 	store.Update("svc-start", StatusStopped, "")
 
 	mux := http.NewServeMux()
@@ -1097,6 +1124,7 @@ func TestAPIStartService(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewRunner: %v", err)
 		}
+		stubNoPortListenersForTest(failRunner)
 		failStore.Update("svc-start-skip-fail", StatusStopped, "")
 
 		failMux := http.NewServeMux()

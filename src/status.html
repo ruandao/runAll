@@ -95,6 +95,7 @@
         <div id="logs-panel-meta" class="logs-panel-meta">last 200 lines, auto-refresh every 2s</div>
       </div>
       <div class="logs-panel-actions">
+        <button id="logs-panel-copy" class="logs-panel-btn" type="button">Copy</button>
         <button id="logs-panel-refresh" class="logs-panel-btn" type="button">Refresh</button>
         <button id="logs-panel-close" class="logs-panel-btn" type="button">Close</button>
       </div>
@@ -422,6 +423,25 @@ function updateLogsMeta(text) {
   document.getElementById('logs-panel-meta').textContent = `${logsState.service || '-'} - ${text} - last ${logLines} lines`;
 }
 
+async function copyLogsToClipboard() {
+  const contentEl = document.getElementById('logs-content');
+  const text = contentEl ? contentEl.textContent : '';
+  if (!text || text.trim() === '' || text.includes('Select a service to view logs')) {
+    updateLogsMeta('copy failed: no logs');
+    return;
+  }
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error('clipboard API unavailable');
+    }
+    updateLogsMeta(`copied at ${formatNowTime()}`);
+  } catch (err) {
+    updateLogsMeta(`copy failed: ${err.message || 'unknown error'}`);
+  }
+}
+
 function formatNowTime() {
   return formatDateTime(new Date());
 }
@@ -586,6 +606,10 @@ document.getElementById('services').addEventListener('click', (event) => {
 document.getElementById('logs-panel-close').addEventListener('click', (event) => {
   pulseClickFeedback(event.currentTarget);
   closeLogsPanel();
+});
+document.getElementById('logs-panel-copy').addEventListener('click', (event) => {
+  pulseClickFeedback(event.currentTarget);
+  copyLogsToClipboard();
 });
 document.getElementById('logs-panel-refresh').addEventListener('click', (event) => {
   pulseClickFeedback(event.currentTarget);

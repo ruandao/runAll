@@ -804,6 +804,11 @@ func (r *Runner) startService(ctx context.Context, name string) error {
 		return fmt.Errorf("service %q is %s, can only start stopped services", name, latest.Status)
 	}
 
+	if err := r.runPreflight(ctx, *svc); err != nil {
+		r.store.SetPID(name, 0)
+		return err
+	}
+
 	node := &ServiceNode{Service: *svc}
 	if err := r.startAndCheck(ctx, node); err != nil {
 		r.stopMonitoring(name)
