@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,14 +21,33 @@ import (
 )
 
 type Runner struct {
-	cfg           *Config
-	store         *StatusStore
-	levels        []ExecutionLevel
-	processes     map[string]*exec.Cmd
-	mu            sync.Mutex
-	monitors      map[string]context.CancelFunc
-	monitorMu     sync.Mutex
-	logRepository domain.ServiceLogRepository
+	cfg                          *Config
+	store                        *StatusStore
+	levels                       []ExecutionLevel
+	processes                    map[string]*exec.Cmd
+	mu                           sync.Mutex
+	monitors                     map[string]context.CancelFunc
+	monitorMu                    sync.Mutex
+	logRepository                domain.ServiceLogRepository
+	ownershipRepo                domain.ServiceOwnershipRepository
+	ownershipGuard               domain.ServiceOwnershipGuardService
+	runtimePrereqProbeRepository domain.ServiceRuntimePrereqProbeRepository
+	preflightFn                  func(context.Context, Service) error
+	listenerPIDsFn               func(string) ([]int, error)
+}
+
+const (
+	defaultOwnershipSessionID = "runall-bootstrap"
+	defaultOwnershipConfigRef = "runtime-managed"
+)
+
+type actorSessionContextKey struct{}
+
+type noopRuntimePrereqProbeRepository struct{}
+
+func (noopRuntimePrereqProbeRepository) Probe(service domain.ManagedService) error {
+	_ = service
+	return nil
 }
 
 type runnerRuntimeContextRepository struct {
@@ -126,14 +146,40 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 		return nil, err
 	}
 
+	ownershipRepo := infrastructure.NewInMemoryServiceOwnershipRepository()
+
 	return &Runner{
-		cfg:           cfg,
-		store:         store,
-		levels:        levels,
-		processes:     make(map[string]*exec.Cmd),
-		monitors:      make(map[string]context.CancelFunc),
-		logRepository: infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity),
+		cfg:                          cfg,
+		store:                        store,
+		levels:                       levels,
+		processes:                    make(map[string]*exec.Cmd),
+		monitors:                     make(map[string]context.CancelFunc),
+		logRepository:                infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity),
+		ownershipRepo:                ownershipRepo,
+		ownershipGuard:               domain.NewServiceOwnershipGuardService(ownershipRepo),
+		runtimePrereqProbeRepository: noopRuntimePrereqProbeRepository{},
+		listenerPIDsFn:               listenerPIDs,
 	}, nil
+}
+
+func withActorSessionID(ctx context.Context, actorSessionID string) context.Context {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, actorSessionContextKey{}, actor)
+}
+
+func actorSessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	raw := ctx.Value(actorSessionContextKey{})
+	actor, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(actor)
 }
 
 func (r *Runner) Run(ctx context.Context, daemon bool) error {
@@ -200,6 +246,16 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 				return
 			default:
 			}
+			if err := r.runPreflight(levelCtx, node.Service); err != nil {
+				current := r.store.Get(node.Service.Name)
+				if current == nil || current.Status != StatusFailed {
+					r.store.Update(node.Service.Name, StatusFailed, fmt.Sprintf("preflight failed: %v", err))
+				}
+				r.store.UpdateDependencyStatus(node.Service.Name, StatusFailed)
+				errCh <- err
+				exitOnce.Do(func() { close(exitFailed); levelCancel() })
+				return
+			}
 			if err := r.startAndCheck(levelCtx, node); err != nil {
 				errCh <- err
 				exitOnce.Do(func() { close(exitFailed); levelCancel() })
@@ -227,6 +283,38 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 	return nil
 }
 
+func (r *Runner) runPreflight(ctx context.Context, svc Service) error {
+	if r.preflightFn != nil {
+		return r.preflightFn(ctx, svc)
+	}
+	if err := r.preflightService(ctx, svc); err != nil {
+		return err
+	}
+	return r.probeRuntimePrerequisite(svc)
+}
+
+func (r *Runner) probeRuntimePrerequisite(svc Service) error {
+	if r.runtimePrereqProbeRepository == nil {
+		return nil
+	}
+
+	status := string(StatusPending)
+	if current := r.store.Get(svc.Name); current != nil {
+		status = string(current.Status)
+	}
+	managedService, err := domain.NewManagedService(svc.Name, "", status, svc.DependsOn)
+	if err != nil {
+		return fmt.Errorf("[%s] build runtime prereq context: %w", svc.Name, err)
+	}
+
+	if err := r.runtimePrereqProbeRepository.Probe(managedService); err != nil {
+		msg := fmt.Sprintf("%s: %v", domain.ServiceFailureCodeRuntimePrereq, err)
+		r.store.RecordPreflightFailure(svc.Name, domain.ServiceFailureCodeRuntimePrereq, msg)
+		return fmt.Errorf("[%s] %s", svc.Name, msg)
+	}
+	return nil
+}
+
 func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	svc := node.Service
 	r.store.Update(svc.Name, StatusStarting, "")
@@ -247,7 +335,12 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.RecordFailure(
+			svc.Name,
+			domain.ServiceLifecyclePhaseLaunch,
+			domain.ServiceFailureCodeProcessExited,
+			err.Error(),
+		)
 		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] stdout pipe: %w", svc.Name, err)
@@ -257,7 +350,12 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.RecordFailure(
+			svc.Name,
+			domain.ServiceLifecyclePhaseLaunch,
+			domain.ServiceFailureCodeProcessExited,
+			err.Error(),
+		)
 		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] stderr pipe: %w", svc.Name, err)
@@ -267,7 +365,12 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		r.store.Update(svc.Name, StatusFailed, err.Error())
+		r.store.RecordFailure(
+			svc.Name,
+			domain.ServiceLifecyclePhaseLaunch,
+			domain.ServiceFailureCodeProcessExited,
+			err.Error(),
+		)
 		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		if svc.OnFailure == "exit" {
 			return fmt.Errorf("[%s] failed to start: %w", svc.Name, err)
@@ -286,9 +389,14 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	// Health check
 	r.store.Update(svc.Name, StatusRetrying, "")
-	err = waitHealthy(ctx, svc.HealthCheck)
+	err = waitHealthyWithLaunchCheck(ctx, cmd.Process, svc.HealthCheck)
 	if err != nil {
-		r.store.Update(svc.Name, StatusFailed, err.Error())
+		phase, code := classifyStartupFailure(err)
+		if phase == "" || code == "" {
+			r.store.Update(svc.Name, StatusFailed, err.Error())
+		} else {
+			r.store.RecordFailure(svc.Name, phase, code, err.Error())
+		}
 		r.store.UpdateDependencyStatus(svc.Name, StatusFailed)
 		log.Printf("[%s] health check failed: %v", svc.Name, err)
 		if svc.OnFailure == "exit" {
@@ -299,8 +407,103 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	r.store.Update(svc.Name, StatusHealthy, "")
 	r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
+	r.establishServiceOwnership(svc, cmd.Process.Pid, actorSessionIDFromContext(ctx))
 	log.Printf("[%s] healthy (%s)", svc.Name, svc.HealthCheck.URL)
 	return nil
+}
+
+func (r *Runner) establishServiceOwnership(svc Service, pid int, actorSessionID string) {
+	if r.ownershipRepo == nil || pid <= 0 {
+		return
+	}
+	owner := strings.TrimSpace(actorSessionID)
+	if owner == "" {
+		owner = defaultOwnershipSessionID
+	}
+	ownership, err := domain.NewServiceOwnership(
+		svc.Name,
+		owner,
+		pid,
+		defaultOwnershipConfigRef,
+		svc.HealthCheck.URL,
+		time.Now(),
+	)
+	if err != nil {
+		log.Printf("[%s] establish ownership skipped: %v", svc.Name, err)
+		return
+	}
+	if err := r.ownershipRepo.Save(ownership); err != nil {
+		log.Printf("[%s] persist ownership skipped: %v", svc.Name, err)
+	}
+}
+
+func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg HealthCheck) error {
+	interval := time.Duration(cfg.Backoff.Initial * float64(time.Second))
+	maxInterval := time.Duration(cfg.Backoff.Max * float64(time.Second))
+	deadline := time.Now().Add(time.Duration(cfg.Timeout) * time.Second)
+	var lastCheckErr error
+
+	for i := 0; i < cfg.Retries; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+
+		if processHasExited(process) {
+			return fmt.Errorf("launch process exited before readiness")
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("health check timed out after %ds", cfg.Timeout)
+		}
+
+		err := checkHealth(ctx, cfg.URL)
+		if err == nil {
+			return nil
+		}
+		lastCheckErr = err
+		if processHasExited(process) {
+			return fmt.Errorf("launch process exited before readiness")
+		}
+
+		interval = time.Duration(float64(interval) * cfg.Backoff.Multiplier)
+		if interval > maxInterval {
+			interval = maxInterval
+		}
+	}
+
+	if lastCheckErr != nil {
+		return fmt.Errorf("health check failed after %d retries: %w", cfg.Retries, lastCheckErr)
+	}
+	return fmt.Errorf("health check failed after %d retries", cfg.Retries)
+}
+
+func processHasExited(process *os.Process) bool {
+	if process == nil {
+		return true
+	}
+	if err := process.Signal(syscall.Signal(0)); err != nil {
+		return true
+	}
+	return false
+}
+
+func classifyStartupFailure(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "", ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "launch process exited before readiness") {
+		return domain.ServiceLifecyclePhaseLaunch, domain.ServiceFailureCodeProcessExited
+	}
+	if strings.Contains(msg, "unhealthy: HTTP") {
+		return domain.ServiceLifecyclePhaseReadiness, domain.ServiceFailureCodeBadReadiness
+	}
+	return domain.ServiceLifecyclePhaseReadiness, domain.ServiceFailureCodeReadinessTimeout
 }
 
 func (r *Runner) Shutdown() {
@@ -344,6 +547,97 @@ func (r *Runner) Shutdown() {
 }
 
 func (r *Runner) RestartService(ctx context.Context, name string) error {
+	return r.restartService(ctx, name)
+}
+
+func (r *Runner) TakeoverService(name string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required for explicit takeover")
+	}
+
+	svc := r.findService(name)
+	if svc == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	current := r.store.Get(name)
+	if current == nil {
+		return fmt.Errorf("service %q not found", name)
+	}
+	existingOwnership, err := r.ownershipRepo.FindByServiceName(name)
+	if err != nil {
+		return err
+	}
+	pid := current.PID
+	if pid <= 0 {
+		pid = r.discoverRunningPIDFromListeners(svc)
+	}
+	usedResidualOwnershipForStoppedOrFailed := pid <= 0 &&
+		(current.Status == StatusStopped || current.Status == StatusFailed) &&
+		existingOwnership.ServiceName != "" && existingOwnership.PID > 0
+	if usedResidualOwnershipForStoppedOrFailed {
+		pid = existingOwnership.PID
+	}
+	if pid <= 0 {
+		return fmt.Errorf("service %q has no running process to take over", name)
+	}
+
+	ownership, err := domain.NewServiceOwnership(
+		name,
+		actor,
+		pid,
+		"takeover",
+		svc.HealthCheck.URL,
+		time.Now(),
+	)
+	if err != nil {
+		return err
+	}
+	if err := r.ownershipRepo.Save(ownership); err != nil {
+		return err
+	}
+	if usedResidualOwnershipForStoppedOrFailed && current.Status == StatusFailed {
+		r.store.Update(name, StatusStopped, "")
+		r.store.UpdateDependencyStatus(name, StatusStopped)
+	}
+	return nil
+}
+
+func (r *Runner) discoverRunningPIDFromListeners(svc *Service) int {
+	if svc == nil {
+		return 0
+	}
+	lookup := r.listenerPIDsFn
+	if lookup == nil {
+		lookup = listenerPIDs
+	}
+	var candidates []int
+	for _, port := range resolveServicePorts(svc) {
+		pids, err := lookup(port)
+		if err != nil {
+			continue
+		}
+		for _, pid := range pids {
+			if pid > 0 {
+				candidates = append(candidates, pid)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+	sort.Ints(candidates)
+	return candidates[0]
+}
+
+func (r *Runner) RestartServiceWithActor(ctx context.Context, name string, actorSessionID string) error {
+	if err := r.ownershipGuard.EnsureOperableBySession(name, actorSessionID); err != nil {
+		return err
+	}
+	return r.restartService(withActorSessionID(ctx, actorSessionID), name)
+}
+
+func (r *Runner) restartService(ctx context.Context, name string) error {
 	svc := r.findService(name)
 	if svc == nil {
 		return fmt.Errorf("service %q not found", name)
@@ -398,6 +692,17 @@ func (r *Runner) RestartService(ctx context.Context, name string) error {
 }
 
 func (r *Runner) StopService(ctx context.Context, name string) error {
+	return r.stopService(ctx, name)
+}
+
+func (r *Runner) StopServiceWithActor(ctx context.Context, name string, actorSessionID string) error {
+	if err := r.ownershipGuard.EnsureOperableBySession(name, actorSessionID); err != nil {
+		return err
+	}
+	return r.stopService(ctx, name)
+}
+
+func (r *Runner) stopService(ctx context.Context, name string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -444,10 +749,33 @@ func (r *Runner) StopService(ctx context.Context, name string) error {
 	r.store.SetPID(name, 0)
 	r.store.Update(name, StatusStopped, "")
 	r.store.UpdateDependencyStatus(name, StatusStopped)
+	if r.ownershipRepo != nil {
+		if err := r.ownershipRepo.DeleteByServiceName(name); err != nil {
+			cleanupErr := fmt.Errorf("ownership cleanup failed: %w", err)
+			r.store.Update(name, StatusFailed, cleanupErr.Error())
+			r.store.UpdateDependencyStatus(name, StatusFailed)
+			return cleanupErr
+		}
+	}
 	return nil
 }
 
 func (r *Runner) StartService(ctx context.Context, name string) error {
+	return r.startService(ctx, name)
+}
+
+func (r *Runner) StartServiceWithActor(ctx context.Context, name string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required")
+	}
+	if err := r.ownershipGuard.EnsureOperableBySession(name, actor); err != nil {
+		return err
+	}
+	return r.startService(withActorSessionID(ctx, actor), name)
+}
+
+func (r *Runner) startService(ctx context.Context, name string) error {
 	svc := r.findService(name)
 	if svc == nil {
 		return fmt.Errorf("service %q not found", name)
@@ -548,6 +876,22 @@ func mergeDependentNames(parts ...[]string) []string {
 }
 
 func (r *Runner) StopGroup(ctx context.Context, group string) error {
+	return r.stopGroup(ctx, group, func(stopCtx context.Context, serviceName string) error {
+		return r.StopService(stopCtx, serviceName)
+	})
+}
+
+func (r *Runner) StopGroupWithActor(ctx context.Context, group string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required")
+	}
+	return r.stopGroup(ctx, group, func(stopCtx context.Context, serviceName string) error {
+		return r.StopServiceWithActor(stopCtx, serviceName, actor)
+	})
+}
+
+func (r *Runner) stopGroup(ctx context.Context, group string, stopFn func(context.Context, string) error) error {
 	var groupServices []Service
 	for _, g := range r.cfg.Groups {
 		if g.Name == group {
@@ -570,7 +914,7 @@ func (r *Runner) StopGroup(ctx context.Context, group string) error {
 			return ctx.Err()
 		default:
 		}
-		if err := r.StopService(ctx, serviceName); err != nil {
+		if err := stopFn(ctx, serviceName); err != nil {
 			return fmt.Errorf("stop group %q failed on %q: %w", group, serviceName, err)
 		}
 	}

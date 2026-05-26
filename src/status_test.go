@@ -1,9 +1,14 @@
 package main
 
 import (
-	"testing"
+	"bytes"
+	"context"
+	"fmt"
 	"strings"
+	"testing"
 	"time"
+
+	"runAll/src/domain"
 )
 
 func TestStatusStore_UpdateAndGet(t *testing.T) {
@@ -228,5 +233,89 @@ func TestStatusStore_CompareAndSwapStatus_NonexistentService(t *testing.T) {
 	swapped := store.CompareAndSwapStatus("nonexistent", StatusHealthy, StatusRestarting)
 	if swapped {
 		t.Fatal("expected swap to fail for nonexistent service")
+	}
+}
+
+func TestStatusStore_UpdateClearsPreflightMetadataOnGenericFailure(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	store.RecordPreflightFailure("svc", "PRECHECK_PORT_CONFLICT", "preflight failed")
+	preflight := store.Get("svc")
+	if preflight.FailurePhase != "preflight" || preflight.FailureCode != "PRECHECK_PORT_CONFLICT" {
+		t.Fatalf("preflight metadata not set: %+v", preflight)
+	}
+
+	store.Update("svc", StatusFailed, "launch failed")
+	got := store.Get("svc")
+	if got.FailurePhase != "" {
+		t.Fatalf("failure_phase should be cleared, got %q", got.FailurePhase)
+	}
+	if got.FailureCode != "" {
+		t.Fatalf("failure_code should be cleared, got %q", got.FailureCode)
+	}
+	if got.Error != "launch failed" {
+		t.Fatalf("error = %q, want %q", got.Error, "launch failed")
+	}
+}
+
+func TestStatusStore_CompareAndSwapStatus_ClearsFailureMetadataWhenNotFailed(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"svc"})
+
+	store.RecordFailure("svc", "readiness", "READINESS_TIMEOUT", "timed out")
+	if !store.CompareAndSwapStatus("svc", StatusFailed, StatusRestarting) {
+		t.Fatal("expected swap to succeed")
+	}
+
+	got := store.Get("svc")
+	if got == nil {
+		t.Fatal("status should exist")
+	}
+	if got.FailurePhase != "" {
+		t.Fatalf("failure_phase should be cleared, got %q", got.FailurePhase)
+	}
+	if got.FailureCode != "" {
+		t.Fatalf("failure_code should be cleared, got %q", got.FailureCode)
+	}
+}
+
+func TestDoctor_ReturnsNonZeroWhenPreflightFails(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "svc-doctor-fail",
+						Command:     "echo running",
+						HealthCheck: HealthCheck{URL: "http://localhost:9123/health"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	runner.preflightFn = func(ctx context.Context, svc Service) error {
+		_ = ctx
+		runner.store.RecordPreflightFailure(
+			svc.Name,
+			domain.ServiceFailureCodePortConflict,
+			"preflight conflict on 9123",
+		)
+		return fmt.Errorf("%s: simulated conflict", domain.ServiceFailureCodePortConflict)
+	}
+
+	var out bytes.Buffer
+	code := RunDoctor(context.Background(), runner, &out)
+	if code != doctorExitPreflightFailed {
+		t.Fatalf("code = %d, want %d", code, doctorExitPreflightFailed)
+	}
+	if !strings.Contains(out.String(), domain.ServiceFailureCodePortConflict) {
+		t.Fatalf("report missing failure code, report=%s", out.String())
 	}
 }

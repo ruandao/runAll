@@ -4,35 +4,40 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"runAll/src/domain"
 )
 
 type Status string
 
 const (
-	StatusPending  Status = "pending"
-	StatusStarting Status = "starting"
-	StatusRetrying Status = "retrying"
-	StatusHealthy  Status = "healthy"
-	StatusFailed   Status = "failed"
-	StatusSkipped  Status = "skipped"
+	StatusPending    Status = "pending"
+	StatusStarting   Status = "starting"
+	StatusRetrying   Status = "retrying"
+	StatusHealthy    Status = "healthy"
+	StatusFailed     Status = "failed"
+	StatusSkipped    Status = "skipped"
 	StatusRestarting Status = "restarting"
-	StatusBuilding  Status = "building"
-	StatusStopped  Status = "stopped"
+	StatusBuilding   Status = "building"
+	StatusStopped    Status = "stopped"
 )
 
 type ServiceStatus struct {
-	Name      string      `json:"name"`
-	Group     string      `json:"group"`
-	Status    Status      `json:"status"`
-	DependsOn []DepStatus `json:"depends_on"`
-	Command   string      `json:"command"`
-	HealthPort string      `json:"health_port"`
-	CommandPort string      `json:"command_port"`
-	URL       string      `json:"url"`
-	PID       int         `json:"pid"`
-	StartedAt string      `json:"started_at"`
-	LastChecked string      `json:"last_checked"`
-	Error     string      `json:"error,omitempty"`
+	Name         string      `json:"name"`
+	Group        string      `json:"group"`
+	Status       Status      `json:"status"`
+	Phase        string      `json:"phase,omitempty"`
+	FailurePhase string      `json:"failure_phase,omitempty"`
+	FailureCode  string      `json:"failure_code,omitempty"`
+	DependsOn    []DepStatus `json:"depends_on"`
+	Command      string      `json:"command"`
+	HealthPort   string      `json:"health_port"`
+	CommandPort  string      `json:"command_port"`
+	URL          string      `json:"url"`
+	PID          int         `json:"pid"`
+	StartedAt    string      `json:"started_at"`
+	LastChecked  string      `json:"last_checked"`
+	Error        string      `json:"error,omitempty"`
 }
 
 type DepStatus struct {
@@ -70,6 +75,11 @@ func (s *StatusStore) Update(name string, status Status, errMsg string) {
 		return
 	}
 	svc.Status = status
+	svc.Phase = phaseForStatus(status)
+	// Update represents a generic state transition, so preflight metadata
+	// must not leak from earlier failures.
+	svc.FailurePhase = ""
+	svc.FailureCode = ""
 	if status == StatusStarting && svc.StartedAt == "" {
 		svc.StartedAt = time.Now().Format(time.RFC3339)
 	}
@@ -77,6 +87,37 @@ func (s *StatusStore) Update(name string, status Status, errMsg string) {
 		svc.Error = errMsg
 	} else if status == StatusHealthy {
 		svc.Error = ""
+	}
+}
+
+func (s *StatusStore) RecordPreflightFailure(name, failureCode, errMsg string) {
+	s.RecordFailure(name, "preflight", failureCode, errMsg)
+}
+
+func (s *StatusStore) RecordFailure(name, failurePhase, failureCode, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	svc, ok := s.services[name]
+	if !ok {
+		return
+	}
+	svc.Status = StatusFailed
+	svc.Phase = failurePhase
+	svc.FailurePhase = failurePhase
+	svc.FailureCode = failureCode
+	svc.Error = errMsg
+}
+
+func phaseForStatus(status Status) string {
+	switch status {
+	case StatusStarting:
+		return domain.ServiceLifecyclePhaseLaunch
+	case StatusRetrying:
+		return domain.ServiceLifecyclePhaseReadiness
+	case StatusHealthy:
+		return domain.ServiceLifecyclePhaseCompleted
+	default:
+		return ""
 	}
 }
 
@@ -155,6 +196,11 @@ func (s *StatusStore) CompareAndSwapStatus(name string, old, new Status) bool {
 		return false
 	}
 	svc.Status = new
+	svc.Phase = phaseForStatus(new)
+	if new != StatusFailed {
+		svc.FailurePhase = ""
+		svc.FailureCode = ""
+	}
 	return true
 }
 

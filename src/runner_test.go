@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,6 +20,37 @@ import (
 	"runAll/src/domain"
 	"runAll/src/infrastructure"
 )
+
+type runtimePrereqProbeRepositoryStub struct {
+	err error
+}
+
+func (s runtimePrereqProbeRepositoryStub) Probe(service domain.ManagedService) error {
+	_ = service
+	return s.err
+}
+
+type deleteOwnershipFailingRepositoryStub struct {
+	delegate  domain.ServiceOwnershipRepository
+	deleteErr error
+}
+
+func (s deleteOwnershipFailingRepositoryStub) FindByServiceName(serviceName string) (domain.ServiceOwnership, error) {
+	return s.delegate.FindByServiceName(serviceName)
+}
+
+func (s deleteOwnershipFailingRepositoryStub) Save(ownership domain.ServiceOwnership) error {
+	return s.delegate.Save(ownership)
+}
+
+func (s deleteOwnershipFailingRepositoryStub) DeleteByServiceName(serviceName string) error {
+	_ = serviceName
+	return s.deleteErr
+}
+
+func (s deleteOwnershipFailingRepositoryStub) ListAll() ([]domain.ServiceOwnership, error) {
+	return s.delegate.ListAll()
+}
 
 func TestRunBuild_Success(t *testing.T) {
 	runner := &Runner{}
@@ -650,6 +682,460 @@ func TestRunner_StopService_BlockedByActiveDownstreamDependency(t *testing.T) {
 	}
 }
 
+func TestStopService_RejectsNonOwnerSession(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-stop",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9210"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-stop", StatusHealthy, "")
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-stop",
+		"owner-session",
+		1234,
+		"config-hash",
+		"http://localhost:9210",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	err = runner.StopServiceWithActor(context.Background(), "owned-stop", "other-session")
+	if err == nil {
+		t.Fatal("expected non-owner stop to be rejected")
+	}
+	if !strings.Contains(err.Error(), "requires explicit takeover") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStopServiceWithActor_ClearsOwnershipAfterStopped(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-stop-clear",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9213"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-stop-clear", StatusHealthy, "")
+	store.SetPID("owned-stop-clear", 2233)
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-stop-clear",
+		"owner-session",
+		2233,
+		"config-hash",
+		"http://localhost:9213",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "owned-stop-clear", "owner-session"); err != nil {
+		t.Fatalf("StopServiceWithActor: %v", err)
+	}
+
+	cleared, err := runner.ownershipRepo.FindByServiceName("owned-stop-clear")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if cleared.ServiceName != "" || cleared.OwnerSessionID != "" || cleared.PID != 0 {
+		t.Fatalf("ownership should be cleared after stop, got: %#v", cleared)
+	}
+}
+
+func TestStopServiceWithActor_OwnershipCleanupFailureReturnsError(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-stop-cleanup-fail",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9214"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-stop-cleanup-fail", StatusHealthy, "")
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-stop-cleanup-fail",
+		"owner-session",
+		2233,
+		"config-hash",
+		"http://localhost:9214",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	runner.ownershipRepo = deleteOwnershipFailingRepositoryStub{
+		delegate:  runner.ownershipRepo,
+		deleteErr: errors.New("delete ownership boom"),
+	}
+
+	err = runner.StopServiceWithActor(context.Background(), "owned-stop-cleanup-fail", "owner-session")
+	if err == nil {
+		t.Fatal("expected stop to fail when ownership cleanup fails")
+	}
+	if !strings.Contains(err.Error(), "ownership cleanup failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	status := store.Get("owned-stop-cleanup-fail")
+	if status == nil {
+		t.Fatal("expected service status")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if !strings.Contains(status.Error, "ownership cleanup failed") {
+		t.Fatalf("status error = %q, want ownership cleanup failed", status.Error)
+	}
+}
+
+func TestStopCleanupFailure_TakeoverThenStartServiceWithActor_Recovers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "cleanup-fail-recover",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("cleanup-fail-recover", StatusStopped, "")
+	runner.listenerPIDsFn = func(string) ([]int, error) {
+		return nil, nil
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "cleanup-fail-recover", "owner-session"); err != nil {
+		t.Fatalf("StartServiceWithActor(owner): %v", err)
+	}
+
+	originalOwnershipRepo := runner.ownershipRepo
+	runner.ownershipRepo = deleteOwnershipFailingRepositoryStub{
+		delegate:  originalOwnershipRepo,
+		deleteErr: errors.New("delete ownership boom"),
+	}
+
+	err = runner.StopServiceWithActor(context.Background(), "cleanup-fail-recover", "owner-session")
+	if err == nil {
+		t.Fatal("expected stop to fail when ownership cleanup fails")
+	}
+
+	statusAfterStop := store.Get("cleanup-fail-recover")
+	if statusAfterStop == nil || statusAfterStop.Status != StatusFailed {
+		t.Fatalf("status after stop = %#v, want failed", statusAfterStop)
+	}
+
+	if err := runner.TakeoverService("cleanup-fail-recover", "other-session"); err != nil {
+		t.Fatalf("TakeoverService(other): %v", err)
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "cleanup-fail-recover", "other-session"); err != nil {
+		t.Fatalf("StartServiceWithActor(other): %v", err)
+	}
+
+	statusAfterRecover := store.Get("cleanup-fail-recover")
+	if statusAfterRecover == nil || statusAfterRecover.Status != StatusHealthy {
+		t.Fatalf("status after recover = %#v, want healthy", statusAfterRecover)
+	}
+
+	runner.ownershipRepo = originalOwnershipRepo
+	runner.ownershipGuard = domain.NewServiceOwnershipGuardService(originalOwnershipRepo)
+	if err := runner.StopServiceWithActor(context.Background(), "cleanup-fail-recover", "other-session"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor(other): %v", err)
+	}
+}
+
+func TestRestartService_RejectsNonOwnerSession(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-restart",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9211"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-restart", StatusHealthy, "")
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-restart",
+		"owner-session",
+		1234,
+		"config-hash",
+		"http://localhost:9211",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	err = runner.RestartServiceWithActor(context.Background(), "owned-restart", "other-session")
+	if err == nil {
+		t.Fatal("expected non-owner restart to be rejected")
+	}
+	if !strings.Contains(err.Error(), "requires explicit takeover") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTakeoverService_DiscoversListenerPIDWhenStorePIDMissing(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-takeover",
+						Command:     "echo worker --port 9212",
+						HealthCheck: HealthCheck{URL: "http://localhost:9212/health"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-takeover", StatusHealthy, "")
+	store.SetPID("owned-takeover", 0)
+
+	runner.listenerPIDsFn = func(port string) ([]int, error) {
+		if port == "9212" {
+			return []int{4321}, nil
+		}
+		return nil, nil
+	}
+
+	if err := runner.TakeoverService("owned-takeover", "takeover-session"); err != nil {
+		t.Fatalf("TakeoverService: %v", err)
+	}
+
+	ownership, err := runner.ownershipRepo.FindByServiceName("owned-takeover")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if ownership.OwnerSessionID != "takeover-session" {
+		t.Fatalf("owner session = %q, want takeover-session", ownership.OwnerSessionID)
+	}
+	if ownership.PID != 4321 {
+		t.Fatalf("ownership pid = %d, want 4321", ownership.PID)
+	}
+}
+
+func TestTakeoverService_StoppedServiceWithResidualOwnershipAllowsExplicitTakeover(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-stopped-takeover",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9215"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-stopped-takeover", StatusStopped, "")
+	store.SetPID("owned-stopped-takeover", 0)
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-stopped-takeover",
+		"owner-session",
+		2233,
+		"config-hash",
+		"http://localhost:9215",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	if err := runner.TakeoverService("owned-stopped-takeover", "other-session"); err != nil {
+		t.Fatalf("TakeoverService: %v", err)
+	}
+
+	takenOwnership, err := runner.ownershipRepo.FindByServiceName("owned-stopped-takeover")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if takenOwnership.OwnerSessionID != "other-session" {
+		t.Fatalf("owner session = %q, want other-session", takenOwnership.OwnerSessionID)
+	}
+}
+
+func TestTakeoverService_ThenStartServiceWithActor_AllowsRecoveryAfterStoppedResidualOwnership(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "stopped-recovery",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("stopped-recovery", StatusStopped, "")
+	store.SetPID("stopped-recovery", 0)
+	runner.listenerPIDsFn = func(string) ([]int, error) {
+		return nil, nil
+	}
+
+	ownership, err := domain.NewServiceOwnership(
+		"stopped-recovery",
+		"owner-session",
+		2233,
+		"config-hash",
+		srv.URL,
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	if err := runner.TakeoverService("stopped-recovery", "other-session"); err != nil {
+		t.Fatalf("TakeoverService: %v", err)
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "stopped-recovery", "other-session"); err != nil {
+		t.Fatalf("StartServiceWithActor: %v", err)
+	}
+
+	status := store.Get("stopped-recovery")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", status)
+	}
+
+	takenOwnership, err := runner.ownershipRepo.FindByServiceName("stopped-recovery")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if takenOwnership.OwnerSessionID != "other-session" {
+		t.Fatalf("owner session = %q, want other-session", takenOwnership.OwnerSessionID)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "stopped-recovery", "other-session"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor: %v", err)
+	}
+}
+
 func TestRunner_StopService_SetsStoppedStatus(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
@@ -815,6 +1301,415 @@ func TestRunner_StopService_StopsDetachedListenerByPortFallback(t *testing.T) {
 	}
 }
 
+func TestRun_FailsFastOnForeignPortConflict(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	foreignPID := startDetachedHTTPServer(t, port)
+	defer func() {
+		_ = syscall.Kill(foreignPID, syscall.SIGKILL)
+	}()
+	waitForPortOpen(t, port, 5*time.Second)
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "conflict-svc",
+						Command:     "sleep 30",
+						HealthCheck: HealthCheck{URL: healthURL},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	startAt := time.Now()
+	err = runner.Run(context.Background(), true)
+	if err == nil {
+		t.Fatal("expected run to fail on foreign port conflict")
+	}
+	if !strings.Contains(err.Error(), "PRECHECK_PORT_CONFLICT") {
+		t.Fatalf("error should contain PRECHECK_PORT_CONFLICT, got: %v", err)
+	}
+
+	if elapsed := time.Since(startAt); elapsed >= 3*time.Second {
+		t.Fatalf("run should fail fast (<3s), got %s", elapsed)
+	}
+
+	status := store.Get("conflict-svc")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if !strings.Contains(status.Error, "PRECHECK_PORT_CONFLICT") {
+		t.Fatalf("status error should contain PRECHECK_PORT_CONFLICT, got: %q", status.Error)
+	}
+}
+
+func TestRun_PreflightGenericErrorMarksServiceFailed(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "preflight-generic-fail",
+						Command:     "sleep 30",
+						HealthCheck: HealthCheck{URL: "http://127.0.0.1:65535/"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	runner.preflightFn = func(context.Context, Service) error {
+		return errors.New("lsof probe failed")
+	}
+
+	err = runner.Run(context.Background(), true)
+	if err == nil {
+		t.Fatal("expected run to fail on generic preflight error")
+	}
+	if !strings.Contains(err.Error(), "lsof probe failed") {
+		t.Fatalf("unexpected run error: %v", err)
+	}
+
+	status := store.Get("preflight-generic-fail")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if !strings.Contains(status.Error, "preflight failed") || !strings.Contains(status.Error, "lsof probe failed") {
+		t.Fatalf("status error should contain diagnostic preflight failure, got: %q", status.Error)
+	}
+}
+
+func TestRun_BlocksOnRuntimePrereqFailure(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "runtime-prereq-fail",
+						Command:     "sleep 30",
+						HealthCheck: HealthCheck{URL: "http://127.0.0.1:65535/"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	runner.runtimePrereqProbeRepository = runtimePrereqProbeRepositoryStub{
+		err: errors.New("docker daemon unavailable"),
+	}
+
+	err = runner.Run(context.Background(), true)
+	if err == nil {
+		t.Fatal("expected run to fail on runtime prerequisite probe error")
+	}
+	if !strings.Contains(err.Error(), domain.ServiceFailureCodeRuntimePrereq) {
+		t.Fatalf("error should contain %s, got: %v", domain.ServiceFailureCodeRuntimePrereq, err)
+	}
+
+	status := store.Get("runtime-prereq-fail")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if status.FailureCode != domain.ServiceFailureCodeRuntimePrereq {
+		t.Fatalf("failure code = %q, want %q", status.FailureCode, domain.ServiceFailureCodeRuntimePrereq)
+	}
+}
+
+func TestRun_SuccessEstablishesOwnership(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	command := fmt.Sprintf("python3 -m http.server %d", port)
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "run-owned",
+						Command: command,
+						HealthCheck: HealthCheck{
+							URL:     healthURL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	defer runner.Shutdown()
+
+	if err := runner.Run(context.Background(), true); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	ownership, err := runner.ownershipRepo.FindByServiceName("run-owned")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if ownership.OwnerSessionID != defaultOwnershipSessionID {
+		t.Fatalf("owner session = %q, want %q", ownership.OwnerSessionID, defaultOwnershipSessionID)
+	}
+	if ownership.PID <= 0 {
+		t.Fatalf("ownership pid = %d, want positive", ownership.PID)
+	}
+}
+
+func TestRun_RegressionMatrix(t *testing.T) {
+	t.Run("port conflict", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+		foreignPID := startDetachedHTTPServer(t, port)
+		defer func() {
+			_ = syscall.Kill(foreignPID, syscall.SIGKILL)
+		}()
+		waitForPortOpen(t, port, 5*time.Second)
+
+		store := NewStatusStore()
+		runner, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{
+					Name: "matrix",
+					Services: []Service{
+						{
+							Name:        "matrix-port-conflict",
+							Command:     "sleep 30",
+							HealthCheck: HealthCheck{URL: healthURL},
+						},
+					},
+				},
+			},
+		}, store)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+
+		err = runner.Run(context.Background(), true)
+		if err == nil {
+			t.Fatal("expected run to fail on foreign port conflict")
+		}
+		if !strings.Contains(err.Error(), domain.ServiceFailureCodePortConflict) {
+			t.Fatalf("error should contain %s, got: %v", domain.ServiceFailureCodePortConflict, err)
+		}
+
+		status := store.Get("matrix-port-conflict")
+		if status == nil {
+			t.Fatal("status should exist")
+		}
+		if status.FailureCode != domain.ServiceFailureCodePortConflict {
+			t.Fatalf("failure code = %q, want %q", status.FailureCode, domain.ServiceFailureCodePortConflict)
+		}
+	})
+
+	t.Run("runtime prereq blocked", func(t *testing.T) {
+		store := NewStatusStore()
+		runner, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{
+					Name: "matrix",
+					Services: []Service{
+						{
+							Name:        "matrix-runtime-blocked",
+							Command:     "sleep 30",
+							HealthCheck: HealthCheck{URL: "http://127.0.0.1:65535/"},
+						},
+					},
+				},
+			},
+		}, store)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+
+		runner.runtimePrereqProbeRepository = runtimePrereqProbeRepositoryStub{
+			err: errors.New("docker daemon unavailable"),
+		}
+
+		err = runner.Run(context.Background(), true)
+		if err == nil {
+			t.Fatal("expected run to fail on runtime prerequisite probe error")
+		}
+		if !strings.Contains(err.Error(), domain.ServiceFailureCodeRuntimePrereq) {
+			t.Fatalf("error should contain %s, got: %v", domain.ServiceFailureCodeRuntimePrereq, err)
+		}
+
+		status := store.Get("matrix-runtime-blocked")
+		if status == nil {
+			t.Fatal("status should exist")
+		}
+		if status.FailureCode != domain.ServiceFailureCodeRuntimePrereq {
+			t.Fatalf("failure code = %q, want %q", status.FailureCode, domain.ServiceFailureCodeRuntimePrereq)
+		}
+	})
+
+	t.Run("prereq repaired healthy", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+		command := fmt.Sprintf("python3 -m http.server %d", port)
+
+		store := NewStatusStore()
+		runner, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{
+					Name: "matrix",
+					Services: []Service{
+						{
+							Name:        "matrix-prereq-repaired",
+							Command:     command,
+							HealthCheck: HealthCheck{URL: healthURL},
+						},
+					},
+				},
+			},
+		}, store)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+		defer runner.Shutdown()
+
+		runner.runtimePrereqProbeRepository = runtimePrereqProbeRepositoryStub{
+			err: errors.New("docker daemon unavailable"),
+		}
+		err = runner.Run(context.Background(), true)
+		if err == nil {
+			t.Fatal("expected first run to fail while runtime prereq is blocked")
+		}
+
+		runner.runtimePrereqProbeRepository = runtimePrereqProbeRepositoryStub{}
+		err = runner.Run(context.Background(), true)
+		if err != nil {
+			t.Fatalf("expected second run to succeed after prereq repaired, got: %v", err)
+		}
+
+		status := store.Get("matrix-prereq-repaired")
+		if status == nil {
+			t.Fatal("status should exist")
+		}
+		if status.Status != StatusHealthy {
+			t.Fatalf("status = %s, want %s", status.Status, StatusHealthy)
+		}
+		if status.FailureCode != "" {
+			t.Fatalf("failure code = %q, want empty after successful rerun", status.FailureCode)
+		}
+	})
+
+	t.Run("non-owner rejected", func(t *testing.T) {
+		store := NewStatusStore()
+		runner, err := NewRunner(&Config{
+			Version: "1",
+			Groups: []Group{
+				{
+					Name: "matrix",
+					Services: []Service{
+						{
+							Name:        "matrix-owned",
+							Command:     "echo worker",
+							HealthCheck: HealthCheck{URL: "http://localhost:9311"},
+						},
+					},
+				},
+			},
+		}, store)
+		if err != nil {
+			t.Fatalf("NewRunner: %v", err)
+		}
+		store.Update("matrix-owned", StatusHealthy, "")
+
+		ownership, err := domain.NewServiceOwnership(
+			"matrix-owned",
+			"owner-session",
+			2233,
+			"config-hash",
+			"http://localhost:9311",
+			time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("NewServiceOwnership: %v", err)
+		}
+		if err := runner.ownershipRepo.Save(ownership); err != nil {
+			t.Fatalf("Save ownership: %v", err)
+		}
+
+		err = runner.StopServiceWithActor(context.Background(), "matrix-owned", "other-session")
+		if err == nil {
+			t.Fatal("expected non-owner stop to be rejected")
+		}
+		if !strings.Contains(err.Error(), "requires explicit takeover") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestRunner_StartService_FromStopped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -856,6 +1751,16 @@ func TestRunner_StartService_FromStopped(t *testing.T) {
 	if got == nil || got.Status != StatusHealthy {
 		t.Fatalf("status = %#v, want healthy", got)
 	}
+	ownership, err := runner.ownershipRepo.FindByServiceName("startable")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if ownership.OwnerSessionID != defaultOwnershipSessionID {
+		t.Fatalf("owner session = %q, want %q", ownership.OwnerSessionID, defaultOwnershipSessionID)
+	}
+	if ownership.PID <= 0 {
+		t.Fatalf("ownership pid = %d, want positive", ownership.PID)
+	}
 
 	runner.monitorMu.Lock()
 	_, monitorExists := runner.monitors["startable"]
@@ -866,6 +1771,161 @@ func TestRunner_StartService_FromStopped(t *testing.T) {
 
 	if err := runner.StopService(context.Background(), "startable"); err != nil {
 		t.Fatalf("cleanup StopService: %v", err)
+	}
+}
+
+func TestRunner_StartServiceWithActor_EstablishesOwnership(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "start-with-actor",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("start-with-actor", StatusStopped, "")
+
+	if err := runner.StartServiceWithActor(context.Background(), "start-with-actor", "ui-session-1"); err != nil {
+		t.Fatalf("StartServiceWithActor: %v", err)
+	}
+
+	ownership, err := runner.ownershipRepo.FindByServiceName("start-with-actor")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if ownership.OwnerSessionID != "ui-session-1" {
+		t.Fatalf("owner session = %q, want ui-session-1", ownership.OwnerSessionID)
+	}
+	if ownership.PID <= 0 {
+		t.Fatalf("ownership pid = %d, want positive", ownership.PID)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "start-with-actor", "ui-session-1"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor: %v", err)
+	}
+}
+
+func TestRunner_StartServiceWithActor_RejectsNonOwner(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "owned-start",
+						Command:     "echo worker",
+						HealthCheck: HealthCheck{URL: "http://localhost:9511"},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("owned-start", StatusStopped, "")
+
+	ownership, err := domain.NewServiceOwnership(
+		"owned-start",
+		"owner-session",
+		1234,
+		"config-hash",
+		"http://localhost:9511",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	err = runner.StartServiceWithActor(context.Background(), "owned-start", "other-session")
+	if err == nil {
+		t.Fatal("expected non-owner start to be rejected")
+	}
+	if !strings.Contains(err.Error(), "requires explicit takeover") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StartServiceWithActor_AllowsNonOwnerAfterOwnerStops(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:    "start-reacquire",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     srv.URL,
+							Timeout: 2,
+							Retries: 2,
+							Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+						},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("start-reacquire", StatusStopped, "")
+
+	if err := runner.StartServiceWithActor(context.Background(), "start-reacquire", "owner-session"); err != nil {
+		t.Fatalf("initial StartServiceWithActor: %v", err)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "start-reacquire", "owner-session"); err != nil {
+		t.Fatalf("StopServiceWithActor: %v", err)
+	}
+
+	if err := runner.StartServiceWithActor(context.Background(), "start-reacquire", "other-session"); err != nil {
+		t.Fatalf("non-owner should be able to start after stopped owner cleanup, got: %v", err)
+	}
+
+	ownership, err := runner.ownershipRepo.FindByServiceName("start-reacquire")
+	if err != nil {
+		t.Fatalf("FindByServiceName: %v", err)
+	}
+	if ownership.OwnerSessionID != "other-session" {
+		t.Fatalf("owner session = %q, want other-session", ownership.OwnerSessionID)
+	}
+
+	if err := runner.StopServiceWithActor(context.Background(), "start-reacquire", "other-session"); err != nil {
+		t.Fatalf("cleanup StopServiceWithActor: %v", err)
 	}
 }
 
@@ -1507,4 +2567,285 @@ func TestStartAndCheck_ProcessSurvivesContextCancel(t *testing.T) {
 
 	// Cleanup
 	runner.stopProcess("sleep-svc")
+}
+
+func TestStartAndCheck_ClassifiesReadinessTimeout(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"readiness-timeout-svc"})
+
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:    "readiness-timeout-svc",
+					Command: "sleep 30",
+					HealthCheck: HealthCheck{
+						URL:     "http://127.0.0.1:1/health",
+						Timeout: 1,
+						Retries: 1,
+						Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1},
+					},
+					OnFailure: "exit",
+				},
+			}},
+		},
+	}
+
+	runner := &Runner{
+		cfg:       cfg,
+		store:     store,
+		processes: make(map[string]*exec.Cmd),
+		monitors:  make(map[string]context.CancelFunc),
+	}
+
+	node := &ServiceNode{Service: cfg.Flatten()[0]}
+	err := runner.startAndCheck(context.Background(), node)
+	if err == nil {
+		t.Fatal("expected readiness failure")
+	}
+
+	status := store.Get("readiness-timeout-svc")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if status.Phase != domain.ServiceLifecyclePhaseReadiness {
+		t.Fatalf("phase = %q, want %q", status.Phase, domain.ServiceLifecyclePhaseReadiness)
+	}
+	if status.FailurePhase != domain.ServiceLifecyclePhaseReadiness {
+		t.Fatalf("failure_phase = %q, want %q", status.FailurePhase, domain.ServiceLifecyclePhaseReadiness)
+	}
+	if status.FailureCode != domain.ServiceFailureCodeReadinessTimeout {
+		t.Fatalf("failure_code = %q, want %q", status.FailureCode, domain.ServiceFailureCodeReadinessTimeout)
+	}
+
+	runner.stopProcess("readiness-timeout-svc")
+}
+
+func TestStartAndCheck_ClassifiesBadReadinessStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	store.Init([]string{"bad-readiness-svc"})
+
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:    "bad-readiness-svc",
+					Command: "sleep 30",
+					HealthCheck: HealthCheck{
+						URL:     srv.URL,
+						Timeout: 1,
+						Retries: 1,
+						Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1},
+					},
+					OnFailure: "exit",
+				},
+			}},
+		},
+	}
+
+	runner := &Runner{
+		cfg:       cfg,
+		store:     store,
+		processes: make(map[string]*exec.Cmd),
+		monitors:  make(map[string]context.CancelFunc),
+	}
+
+	node := &ServiceNode{Service: cfg.Flatten()[0]}
+	err := runner.startAndCheck(context.Background(), node)
+	if err == nil {
+		t.Fatal("expected bad readiness status failure")
+	}
+
+	status := store.Get("bad-readiness-svc")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if status.Phase != domain.ServiceLifecyclePhaseReadiness {
+		t.Fatalf("phase = %q, want %q", status.Phase, domain.ServiceLifecyclePhaseReadiness)
+	}
+	if status.FailureCode != domain.ServiceFailureCodeBadReadiness {
+		t.Fatalf("failure_code = %q, want %q", status.FailureCode, domain.ServiceFailureCodeBadReadiness)
+	}
+
+	runner.stopProcess("bad-readiness-svc")
+}
+
+func TestStartAndCheck_ClassifiesLaunchProcessExited(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"launch-fail-svc"})
+
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:       "launch-fail-svc",
+					Command:    "sleep 30",
+					WorkingDir: "/path/does/not/exist",
+					HealthCheck: HealthCheck{
+						URL:     "http://127.0.0.1:1/health",
+						Timeout: 1,
+						Retries: 1,
+						Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1},
+					},
+					OnFailure: "exit",
+				},
+			}},
+		},
+	}
+
+	runner := &Runner{
+		cfg:       cfg,
+		store:     store,
+		processes: make(map[string]*exec.Cmd),
+		monitors:  make(map[string]context.CancelFunc),
+	}
+
+	node := &ServiceNode{Service: cfg.Flatten()[0]}
+	err := runner.startAndCheck(context.Background(), node)
+	if err == nil {
+		t.Fatal("expected launch failure")
+	}
+
+	status := store.Get("launch-fail-svc")
+	if status == nil {
+		t.Fatal("status should exist")
+	}
+	if status.Status != StatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	}
+	if status.Phase != domain.ServiceLifecyclePhaseLaunch {
+		t.Fatalf("phase = %q, want %q", status.Phase, domain.ServiceLifecyclePhaseLaunch)
+	}
+	if status.FailureCode != domain.ServiceFailureCodeProcessExited {
+		t.Fatalf("failure_code = %q, want %q", status.FailureCode, domain.ServiceFailureCodeProcessExited)
+	}
+}
+
+func TestStartAndCheck_ContextCancellationNotClassifiedAsReadinessTimeout(t *testing.T) {
+	t.Run("context canceled", func(t *testing.T) {
+		store := NewStatusStore()
+		store.Init([]string{"ctx-canceled-svc"})
+
+		cfg := &Config{
+			Version: "1",
+			Groups: []Group{
+				{Name: "g1", Services: []Service{
+					{
+						Name:    "ctx-canceled-svc",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:1/health",
+							Timeout: 5,
+							Retries: 5,
+							Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1},
+						},
+						OnFailure: "exit",
+					},
+				}},
+			},
+		}
+
+		runner := &Runner{
+			cfg:       cfg,
+			store:     store,
+			processes: make(map[string]*exec.Cmd),
+			monitors:  make(map[string]context.CancelFunc),
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		node := &ServiceNode{Service: cfg.Flatten()[0]}
+		err := runner.startAndCheck(ctx, node)
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled, got: %v", err)
+		}
+
+		status := store.Get("ctx-canceled-svc")
+		if status == nil {
+			t.Fatal("status should exist")
+		}
+		if status.FailureCode == domain.ServiceFailureCodeReadinessTimeout {
+			t.Fatalf("failure_code should not be readiness timeout, got %q", status.FailureCode)
+		}
+		if status.FailureCode != "" {
+			t.Fatalf("failure_code should be empty for context cancellation, got %q", status.FailureCode)
+		}
+		if status.FailurePhase != "" {
+			t.Fatalf("failure_phase should be empty for context cancellation, got %q", status.FailurePhase)
+		}
+
+		runner.stopProcess("ctx-canceled-svc")
+	})
+
+	t.Run("deadline exceeded", func(t *testing.T) {
+		store := NewStatusStore()
+		store.Init([]string{"ctx-deadline-svc"})
+
+		cfg := &Config{
+			Version: "1",
+			Groups: []Group{
+				{Name: "g1", Services: []Service{
+					{
+						Name:    "ctx-deadline-svc",
+						Command: "sleep 30",
+						HealthCheck: HealthCheck{
+							URL:     "http://127.0.0.1:1/health",
+							Timeout: 5,
+							Retries: 5,
+							Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1},
+						},
+						OnFailure: "exit",
+					},
+				}},
+			},
+		}
+
+		runner := &Runner{
+			cfg:       cfg,
+			store:     store,
+			processes: make(map[string]*exec.Cmd),
+			monitors:  make(map[string]context.CancelFunc),
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		time.Sleep(20 * time.Millisecond)
+
+		node := &ServiceNode{Service: cfg.Flatten()[0]}
+		err := runner.startAndCheck(ctx, node)
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline exceeded, got: %v", err)
+		}
+
+		status := store.Get("ctx-deadline-svc")
+		if status == nil {
+			t.Fatal("status should exist")
+		}
+		if status.FailureCode == domain.ServiceFailureCodeReadinessTimeout {
+			t.Fatalf("failure_code should not be readiness timeout, got %q", status.FailureCode)
+		}
+		if status.FailureCode != "" {
+			t.Fatalf("failure_code should be empty for deadline exceeded, got %q", status.FailureCode)
+		}
+		if status.FailurePhase != "" {
+			t.Fatalf("failure_phase should be empty for deadline exceeded, got %q", status.FailurePhase)
+		}
+
+		runner.stopProcess("ctx-deadline-svc")
+	})
 }

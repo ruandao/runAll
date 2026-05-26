@@ -283,3 +283,95 @@ groups:
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestLoadConfig_FailsWhenDualConfigMismatch(t *testing.T) {
+	primaryYAML := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: svc
+        command: "echo primary"
+        health_check:
+          url: "http://localhost:1"
+`
+	secondaryYAML := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: svc
+        command: "echo secondary"
+        health_check:
+          url: "http://localhost:1"
+`
+	dir := t.TempDir()
+	primaryPath := filepath.Join(dir, "config.primary.yaml")
+	secondaryPath := filepath.Join(dir, "config.secondary.yaml")
+	os.WriteFile(primaryPath, []byte(primaryYAML), 0644)
+	os.WriteFile(secondaryPath, []byte(secondaryYAML), 0644)
+
+	_, _, err := LoadConfigWithSourceGuard(primaryPath, secondaryPath)
+	if err == nil {
+		t.Fatal("expected mismatch error when dual config hashes differ")
+	}
+	if !strings.Contains(err.Error(), "config source mismatch") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadConfig_RegressionMatrixFixtures(t *testing.T) {
+	yaml := `
+version: "1"
+groups:
+  - name: regression
+    services:
+      - name: matrix-port-conflict
+        command: "python3 -m http.server 28080"
+        health_check:
+          url: "http://127.0.0.1:28080/health"
+      - name: matrix-runtime-prereq-blocked
+        command: "docker compose up"
+        health_check:
+          url: "http://127.0.0.1:28081/health"
+      - name: matrix-prereq-repaired-healthy
+        command: "docker compose up"
+        health_check:
+          url: "http://127.0.0.1:28082/health"
+      - name: matrix-non-owner-rejected
+        command: "echo worker"
+        health_check:
+          url: "http://127.0.0.1:28083/health"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	services := cfg.Flatten()
+	if len(services) != 4 {
+		t.Fatalf("services len = %d, want 4", len(services))
+	}
+
+	gotNames := map[string]bool{}
+	for _, svc := range services {
+		gotNames[svc.Name] = true
+		if svc.HealthCheck.URL == "" {
+			t.Fatalf("service %q health_check.url should not be empty", svc.Name)
+		}
+	}
+	for _, name := range []string{
+		"matrix-port-conflict",
+		"matrix-runtime-prereq-blocked",
+		"matrix-prereq-repaired-healthy",
+		"matrix-non-owner-rejected",
+	} {
+		if !gotNames[name] {
+			t.Fatalf("service %q not found in loaded config", name)
+		}
+	}
+}

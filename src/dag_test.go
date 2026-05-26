@@ -7,10 +7,10 @@ import (
 
 func makeService(name string, deps ...string) Service {
 	return Service{
-		Name:      name,
-		Command:   "echo " + name,
+		Name:        name,
+		Command:     "echo " + name,
 		HealthCheck: HealthCheck{URL: "http://localhost/" + name},
-		DependsOn: deps,
+		DependsOn:   deps,
 	}
 }
 

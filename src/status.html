@@ -224,19 +224,19 @@ async function refresh() {
 }
 
 async function buildService(name) {
-  await postServiceAction('/api/build', name, 'Build');
+  await postServiceAction('/api/build', name, 'Build', false);
 }
 
 async function restartService(name) {
-  await postServiceAction('/api/restart', name, 'Restart');
+  await postServiceAction('/api/restart', name, 'Restart', true);
 }
 
 async function stopService(name) {
-  await postServiceAction('/api/stop', name, 'Stop');
+  await postServiceAction('/api/stop', name, 'Stop', true);
 }
 
 async function startService(name) {
-  await postServiceAction('/api/start', name, 'Start');
+  await postServiceAction('/api/start', name, 'Start', true);
 }
 
 async function stopGroup(group) {
@@ -264,12 +264,27 @@ async function clearLogs(name) {
   }
 }
 
-async function postServiceAction(url, name, label) {
+function getSessionID() {
+  const storageKey = 'runall_session_id';
+  const existing = (window.localStorage && localStorage.getItem(storageKey)) || '';
+  if (existing && existing.trim()) return existing;
+  const generated = (window.crypto && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID()
+    : `session-${Date.now()}`;
+  if (window.localStorage) localStorage.setItem(storageKey, generated);
+  return generated;
+}
+
+async function postServiceAction(url, name, label, includeSession) {
   try {
+    const payload = {name: name};
+    if (includeSession) {
+      payload.session_id = getSessionID();
+    }
     const resp = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: name})
+      body: JSON.stringify(payload)
     });
     const result = await parseJsonSafe(resp);
     if (!resp.ok) {
@@ -287,7 +302,7 @@ async function postGroupAction(url, group, label) {
     const resp = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({group: group})
+      body: JSON.stringify({group: group, session_id: getSessionID()})
     });
     const result = await parseJsonSafe(resp);
     if (!resp.ok) {

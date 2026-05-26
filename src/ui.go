@@ -16,6 +16,12 @@ var statusHTML embed.FS
 
 const maxLogsLines = 2000
 
+type serviceStatusPayload struct {
+	*ServiceStatus
+	Hint      string `json:"hint,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
 func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) {
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -23,28 +29,28 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(store.All()); err != nil {
+		if err := json.NewEncoder(w).Encode(buildStatusPayload(store, runner)); err != nil {
 			log.Printf("[ui] json encode error: %v", err)
 		}
 	})
 
 	mux.HandleFunc("/api/restart", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceAction(w, r, runner, "name", func(ctx context.Context, name string) error {
+		handleServiceActionWithSession(w, r, runner, "name", func(ctx context.Context, name string, sessionID string) error {
 			log.Printf("[api] restart request for %s", name)
-			return runner.RestartService(ctx, name)
+			return runner.RestartServiceWithActor(ctx, name, sessionID)
 		})
 	})
 
 	mux.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceAction(w, r, runner, "name", runner.StopService)
+		handleServiceActionWithSession(w, r, runner, "name", runner.StopServiceWithActor)
 	})
 
 	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceAction(w, r, runner, "name", runner.StartService)
+		handleServiceActionWithSession(w, r, runner, "name", runner.StartServiceWithActor)
 	})
 
 	mux.HandleFunc("/api/stop-group", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceAction(w, r, runner, "group", runner.StopGroup)
+		handleServiceActionWithSession(w, r, runner, "group", runner.StopGroupWithActor)
 	})
 
 	mux.HandleFunc("/api/build", func(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +163,19 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	}
 }
 
+func buildStatusPayload(store *StatusStore, runner *Runner) []serviceStatusPayload {
+	services := store.All()
+	result := make([]serviceStatusPayload, 0, len(services))
+	for _, svc := range services {
+		result = append(result, serviceStatusPayload{
+			ServiceStatus: svc,
+			Hint:          deriveFailureHint(svc),
+			SessionID:     resolveServiceSessionID(runner, svc.Name),
+		})
+	}
+	return result
+}
+
 func writeJSONError(w http.ResponseWriter, message string) {
 	writeJSONErrorWithStatus(w, http.StatusBadRequest, message)
 }
@@ -190,11 +209,60 @@ func handleServiceAction(w http.ResponseWriter, r *http.Request, runner *Runner,
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+func handleServiceActionWithSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	runner *Runner,
+	fieldName string,
+	action func(context.Context, string, string) error,
+) {
+	if r.Method != http.MethodPost {
+		writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	payload, err := readJSONPayload(r)
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	body, err := readRequiredStringField(payload, fieldName)
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	sessionID, err := readRequiredStringField(payload, "session_id")
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	if runner == nil {
+		writeJSONError(w, "runner is required")
+		return
+	}
+	if err := action(r.Context(), body, sessionID); err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
 func readStringFieldFromJSON(r *http.Request, fieldName string) (string, error) {
+	payload, err := readJSONPayload(r)
+	if err != nil {
+		return "", err
+	}
+	return readRequiredStringField(payload, fieldName)
+}
+
+func readJSONPayload(r *http.Request) (map[string]any, error) {
 	var payload map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		return "", fmt.Errorf("invalid json")
+		return nil, fmt.Errorf("invalid json")
 	}
+	return payload, nil
+}
+
+func readRequiredStringField(payload map[string]any, fieldName string) (string, error) {
 	raw, ok := payload[fieldName]
 	if !ok {
 		return "", fmt.Errorf("%s is required", fieldName)

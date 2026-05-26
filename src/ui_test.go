@@ -88,6 +88,184 @@ func TestAPIStatus_IncludesPortFields(t *testing.T) {
 	}
 }
 
+func TestUIIncludesFailureFields(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "svc-failure-ui",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:8081/health"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.SetPID("svc-failure-ui", 12345)
+	if err := runner.TakeoverService("svc-failure-ui", "session-ui-owner"); err != nil {
+		t.Fatalf("TakeoverService: %v", err)
+	}
+	store.RecordFailure("svc-failure-ui", "readiness", "READINESS_TIMEOUT", "waiting on /health")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var result []map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("len = %d, want 1", len(result))
+	}
+	if result[0]["failure_phase"] != "readiness" {
+		t.Fatalf("failure_phase = %#v, want readiness", result[0]["failure_phase"])
+	}
+	if result[0]["failure_code"] != "READINESS_TIMEOUT" {
+		t.Fatalf("failure_code = %#v, want READINESS_TIMEOUT", result[0]["failure_code"])
+	}
+	if result[0]["hint"] != "waiting on /health" {
+		t.Fatalf("hint = %#v, want waiting on /health", result[0]["hint"])
+	}
+	if result[0]["session_id"] != "session-ui-owner" {
+		t.Fatalf("session_id = %#v, want session-ui-owner", result[0]["session_id"])
+	}
+}
+
+func TestAPIStatus_RegressionMatrixPayload(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "matrix", Services: []Service{
+				{
+					Name:        "matrix-port-conflict",
+					Command:     "python3 -m http.server 28180",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:28180/health"},
+				},
+				{
+					Name:        "matrix-runtime-prereq-blocked",
+					Command:     "docker compose up",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:28181/health"},
+				},
+				{
+					Name:        "matrix-prereq-repaired-healthy",
+					Command:     "docker compose up",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:28182/health"},
+				},
+				{
+					Name:        "matrix-non-owner-rejected",
+					Command:     "echo worker",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:28183/health"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	store.RecordPreflightFailure(
+		"matrix-port-conflict",
+		domain.ServiceFailureCodePortConflict,
+		"PRECHECK_PORT_CONFLICT: foreign listener on 28180",
+	)
+	store.RecordPreflightFailure(
+		"matrix-runtime-prereq-blocked",
+		domain.ServiceFailureCodeRuntimePrereq,
+		"PRECHECK_RUNTIME_PREREQ_FAILED: docker daemon unavailable",
+	)
+	store.Update("matrix-prereq-repaired-healthy", StatusHealthy, "")
+
+	ownership, err := domain.NewServiceOwnership(
+		"matrix-non-owner-rejected",
+		"owner-session",
+		4321,
+		"config-hash",
+		"http://127.0.0.1:28183/health",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+	store.Update("matrix-non-owner-rejected", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var payload []map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if len(payload) != 4 {
+		t.Fatalf("len = %d, want 4", len(payload))
+	}
+
+	byName := make(map[string]map[string]any, len(payload))
+	for _, item := range payload {
+		name, _ := item["name"].(string)
+		byName[name] = item
+	}
+	for _, name := range []string{
+		"matrix-port-conflict",
+		"matrix-runtime-prereq-blocked",
+		"matrix-prereq-repaired-healthy",
+		"matrix-non-owner-rejected",
+	} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("status payload missing service %q", name)
+		}
+	}
+
+	if byName["matrix-port-conflict"]["failure_code"] != domain.ServiceFailureCodePortConflict {
+		t.Fatalf("port conflict failure_code = %#v", byName["matrix-port-conflict"]["failure_code"])
+	}
+	if !strings.Contains(byName["matrix-port-conflict"]["hint"].(string), domain.ServiceFailureCodePortConflict) {
+		t.Fatalf("port conflict hint should contain failure code, got %#v", byName["matrix-port-conflict"]["hint"])
+	}
+
+	if byName["matrix-runtime-prereq-blocked"]["failure_code"] != domain.ServiceFailureCodeRuntimePrereq {
+		t.Fatalf("runtime prereq failure_code = %#v", byName["matrix-runtime-prereq-blocked"]["failure_code"])
+	}
+	if !strings.Contains(byName["matrix-runtime-prereq-blocked"]["hint"].(string), domain.ServiceFailureCodeRuntimePrereq) {
+		t.Fatalf("runtime prereq hint should contain failure code, got %#v", byName["matrix-runtime-prereq-blocked"]["hint"])
+	}
+
+	if byName["matrix-prereq-repaired-healthy"]["status"] != string(StatusHealthy) {
+		t.Fatalf("prereq repaired status = %#v, want healthy", byName["matrix-prereq-repaired-healthy"]["status"])
+	}
+	if gotCode := byName["matrix-prereq-repaired-healthy"]["failure_code"]; gotCode != nil && gotCode != "" {
+		t.Fatalf("prereq repaired failure_code = %#v, want empty", gotCode)
+	}
+
+	if byName["matrix-non-owner-rejected"]["session_id"] != "owner-session" {
+		t.Fatalf("non-owner case session_id = %#v, want owner-session", byName["matrix-non-owner-rejected"]["session_id"])
+	}
+}
+
 func TestUIHomePage(t *testing.T) {
 	store := NewStatusStore()
 	store.Init([]string{"svc"})
@@ -122,6 +300,7 @@ func TestUIHomePage(t *testing.T) {
 		`function openLogsPanel(name)`,
 		`function closeLogsPanel()`,
 		`function postGroupAction(url, group, label)`,
+		`JSON.stringify({group: group, session_id: getSessionID()})`,
 		`/api/build`,
 		`/api/stop`,
 		`/api/start`,
@@ -730,32 +909,62 @@ func TestAPIStopService(t *testing.T) {
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "name is required")
 	})
 
+	t.Run("missing session id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "session_id is required")
+	})
+
 	t.Run("runner nil", func(t *testing.T) {
 		muxWithNilRunner := http.NewServeMux()
 		registerUIHandlers(muxWithNilRunner, store, nil)
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		muxWithNilRunner.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
 	})
 
 	t.Run("runner error passthrough", func(t *testing.T) {
-		expectedErr := runner.StopService(context.Background(), "missing-service")
+		expectedErr := runner.StopServiceWithActor(context.Background(), "missing-service", "owner-session")
 		if expectedErr == nil {
 			t.Fatal("expected StopService error for missing service")
 		}
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"missing-service"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"missing-service","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
 	})
 
+	t.Run("non owner rejected", func(t *testing.T) {
+		store.SetPID("svc-stop", 1234)
+		ownership, err := domain.NewServiceOwnership(
+			"svc-stop",
+			"owner-session",
+			1234,
+			"config-hash",
+			"http://localhost:9986",
+			time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("NewServiceOwnership: %v", err)
+		}
+		if err := runner.ownershipRepo.Save(ownership); err != nil {
+			t.Fatalf("Save ownership: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"other-session"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, `service "svc-stop" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
+	})
+
 	t.Run("success", func(t *testing.T) {
 		store.Update("svc-stop", StatusHealthy, "")
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 
@@ -813,23 +1022,30 @@ func TestAPIStartService(t *testing.T) {
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "name is required")
 	})
 
+	t.Run("missing session id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "session_id is required")
+	})
+
 	t.Run("runner nil", func(t *testing.T) {
 		muxWithNilRunner := http.NewServeMux()
 		registerUIHandlers(muxWithNilRunner, store, nil)
 
-		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		muxWithNilRunner.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
 	})
 
 	t.Run("runner error passthrough", func(t *testing.T) {
-		expectedErr := runner.StartService(context.Background(), "missing-service")
+		expectedErr := runner.StartServiceWithActor(context.Background(), "missing-service", "owner-session")
 		if expectedErr == nil {
 			t.Fatal("expected StartService error for missing service")
 		}
 
-		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"missing-service"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"missing-service","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
@@ -838,7 +1054,7 @@ func TestAPIStartService(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		store.Update("svc-start", StatusStopped, "")
 
-		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 
@@ -886,7 +1102,7 @@ func TestAPIStartService(t *testing.T) {
 		failMux := http.NewServeMux()
 		registerUIHandlers(failMux, failStore, failRunner)
 
-		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start-skip-fail"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start-skip-fail","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		failMux.ServeHTTP(rec, req)
 		assertJSONErrorResponse(t, rec, http.StatusBadRequest)
@@ -925,10 +1141,82 @@ func TestAPIRestart_OnFailureSkipStartupFailureReturnsError(t *testing.T) {
 	mux := http.NewServeMux()
 	registerUIHandlers(mux, store, runner)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-skip-fail"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-skip-fail","session_id":"owner-session"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+}
+
+func TestAPIRestart_RequiresSessionID(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g-restart", Services: []Service{
+				{
+					Name:        "svc-restart",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9979"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-restart", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	assertJSONErrorMessage(t, rec, http.StatusBadRequest, "session_id is required")
+}
+
+func TestAPIRestart_NonOwnerRejected(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g-restart", Services: []Service{
+				{
+					Name:        "svc-restart-owned",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9978"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("svc-restart-owned", StatusHealthy, "")
+	ownership, err := domain.NewServiceOwnership(
+		"svc-restart-owned",
+		"owner-session",
+		1234,
+		"config-hash",
+		"http://localhost:9978",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceOwnership: %v", err)
+	}
+	if err := runner.ownershipRepo.Save(ownership); err != nil {
+		t.Fatalf("Save ownership: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-owned","session_id":"other-session"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	assertJSONErrorMessage(t, rec, http.StatusBadRequest, `service "svc-restart-owned" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
 }
 
 func TestAPIStopGroup(t *testing.T) {
@@ -967,11 +1255,18 @@ func TestAPIStopGroup(t *testing.T) {
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "group is required")
 	})
 
+	t.Run("missing session id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "session_id is required")
+	})
+
 	t.Run("runner nil", func(t *testing.T) {
 		muxWithNilRunner := http.NewServeMux()
 		registerUIHandlers(muxWithNilRunner, store, nil)
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		muxWithNilRunner.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, "runner is required")
@@ -983,16 +1278,39 @@ func TestAPIStopGroup(t *testing.T) {
 			t.Fatal("expected StopGroup error for missing group")
 		}
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"missing-group"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"missing-group","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
 	})
 
+	t.Run("non owner rejected", func(t *testing.T) {
+		store.SetPID("svc-stop-group", 1234)
+		ownership, err := domain.NewServiceOwnership(
+			"svc-stop-group",
+			"owner-session",
+			1234,
+			"config-hash",
+			"http://localhost:9988",
+			time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("NewServiceOwnership: %v", err)
+		}
+		if err := runner.ownershipRepo.Save(ownership); err != nil {
+			t.Fatalf("Save ownership: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop","session_id":"other-session"}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		assertJSONErrorMessage(t, rec, http.StatusBadRequest, `stop group "g-stop" failed on "svc-stop-group": service "svc-stop-group" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
+	})
+
 	t.Run("success", func(t *testing.T) {
 		store.Update("svc-stop-group", StatusHealthy, "")
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 
