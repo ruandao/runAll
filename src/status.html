@@ -179,6 +179,7 @@ async function refresh() {
       const isStopped = svc.status === 'stopped';
       const toggleAction = isStopped ? 'start' : 'stop';
       const toggleLabel = isStopped ? '启动' : '关闭';
+      const sessionID = typeof svc.session_id === 'string' ? svc.session_id.trim() : '';
       const healthPort = normalizePortValue(svc.health_port);
       const commandPort = normalizePortValue(svc.command_port);
       const healthHref = resolveHealthHref(svc.url, healthPort);
@@ -189,9 +190,9 @@ async function refresh() {
       html += `<span class="status">${svc.status}</span>`;
       html += `<span class="ports">health/command: ${portLink(healthPort, healthHref)} / ${portLink(commandPort, commandHref)}</span>`;
       html += `<span class="actions">`;
-      html += `<button class="action-btn" type="button" data-action="${toggleAction}" data-name="${esc(svc.name)}">${toggleLabel}</button>`;
+      html += `<button class="action-btn" type="button" data-action="${toggleAction}" data-name="${esc(svc.name)}" data-session-id="${esc(sessionID)}">${toggleLabel}</button>`;
       html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
-      html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}">重启</button>`;
+      html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}" data-session-id="${esc(sessionID)}">重启</button>`;
       html += `<button class="action-btn logs-btn" type="button" data-action="logs" data-name="${esc(svc.name)}">日志</button>`;
       html += `<button class="action-btn clear-logs-btn" type="button" data-action="clear-logs" data-name="${esc(svc.name)}">清空日志</button>`;
       html += `</span>`;
@@ -227,16 +228,16 @@ async function buildService(name) {
   await postServiceAction('/api/build', name, 'Build', false);
 }
 
-async function restartService(name) {
-  await postServiceAction('/api/restart', name, 'Restart', true);
+async function restartService(name, sessionID) {
+  await postServiceAction('/api/restart', name, 'Restart', true, sessionID);
 }
 
-async function stopService(name) {
-  await postServiceAction('/api/stop', name, 'Stop', true);
+async function stopService(name, sessionID) {
+  await postServiceAction('/api/stop', name, 'Stop', true, sessionID);
 }
 
-async function startService(name) {
-  await postServiceAction('/api/start', name, 'Start', true);
+async function startService(name, sessionID) {
+  await postServiceAction('/api/start', name, 'Start', true, sessionID);
 }
 
 async function stopGroup(group) {
@@ -275,11 +276,19 @@ function getSessionID() {
   return generated;
 }
 
-async function postServiceAction(url, name, label, includeSession) {
+function selectActorSessionID(explicitSessionID) {
+  const candidate = typeof explicitSessionID === 'string' ? explicitSessionID.trim() : '';
+  if (candidate) {
+    return candidate;
+  }
+  return getSessionID();
+}
+
+async function postServiceAction(url, name, label, includeSession, explicitSessionID) {
   try {
     const payload = {name: name};
     if (includeSession) {
-      payload.session_id = getSessionID();
+      payload.session_id = selectActorSessionID(explicitSessionID);
     }
     const resp = await fetch(url, {
       method: 'POST',
@@ -540,12 +549,13 @@ document.getElementById('services').addEventListener('click', (event) => {
   const action = btn.getAttribute('data-action');
   const name = btn.getAttribute('data-name');
   const group = btn.getAttribute('data-group');
+  const sessionID = btn.getAttribute('data-session-id') || '';
   if (action === 'start' && name) {
-    startService(name);
+    startService(name, sessionID);
     return;
   }
   if (action === 'stop' && name) {
-    stopService(name);
+    stopService(name, sessionID);
     return;
   }
   if (action === 'build') {
@@ -555,7 +565,7 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
   if (action === 'restart') {
     if (!name) return;
-    restartService(name);
+    restartService(name, sessionID);
     return;
   }
   if (action === 'logs') {

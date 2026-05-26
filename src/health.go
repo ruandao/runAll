@@ -12,6 +12,7 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 	maxInterval := time.Duration(cfg.Backoff.Max * float64(time.Second))
 
 	deadline := time.Now().Add(time.Duration(cfg.Timeout) * time.Second)
+	var lastCheckErr error
 
 	for i := 0; i < cfg.Retries; i++ {
 		select {
@@ -21,6 +22,9 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 		}
 
 		if time.Now().After(deadline) {
+			if lastCheckErr != nil {
+				return fmt.Errorf("health check timed out after %ds (last error: %v)", cfg.Timeout, lastCheckErr)
+			}
 			return fmt.Errorf("health check timed out after %ds", cfg.Timeout)
 		}
 
@@ -32,6 +36,11 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
 			resp.Body.Close()
 			return nil
+		}
+		if err != nil {
+			lastCheckErr = err
+		} else if resp != nil {
+			lastCheckErr = fmt.Errorf("unhealthy: HTTP %d", resp.StatusCode)
 		}
 		if resp != nil {
 			resp.Body.Close()

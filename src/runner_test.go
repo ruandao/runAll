@@ -1301,7 +1301,7 @@ func TestRunner_StopService_StopsDetachedListenerByPortFallback(t *testing.T) {
 	}
 }
 
-func TestRun_FailsFastOnForeignPortConflict(t *testing.T) {
+func TestRun_CleansForeignPortConflictBeforeStart(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -1312,6 +1312,7 @@ func TestRun_FailsFastOnForeignPortConflict(t *testing.T) {
 	}
 
 	healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	command := fmt.Sprintf("python3 -m http.server %d", port)
 	foreignPID := startDetachedHTTPServer(t, port)
 	defer func() {
 		_ = syscall.Kill(foreignPID, syscall.SIGKILL)
@@ -1327,7 +1328,7 @@ func TestRun_FailsFastOnForeignPortConflict(t *testing.T) {
 				Services: []Service{
 					{
 						Name:        "conflict-svc",
-						Command:     "sleep 30",
+						Command:     command,
 						HealthCheck: HealthCheck{URL: healthURL},
 					},
 				},
@@ -1338,28 +1339,26 @@ func TestRun_FailsFastOnForeignPortConflict(t *testing.T) {
 		t.Fatalf("NewRunner: %v", err)
 	}
 
-	startAt := time.Now()
 	err = runner.Run(context.Background(), true)
-	if err == nil {
-		t.Fatal("expected run to fail on foreign port conflict")
+	if err != nil {
+		t.Fatalf("expected run to succeed after port cleanup, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "PRECHECK_PORT_CONFLICT") {
-		t.Fatalf("error should contain PRECHECK_PORT_CONFLICT, got: %v", err)
-	}
+	defer runner.Shutdown()
 
-	if elapsed := time.Since(startAt); elapsed >= 3*time.Second {
-		t.Fatalf("run should fail fast (<3s), got %s", elapsed)
-	}
+	waitForProcessExit(t, foreignPID, 5*time.Second)
 
 	status := store.Get("conflict-svc")
 	if status == nil {
 		t.Fatal("status should exist")
 	}
-	if status.Status != StatusFailed {
-		t.Fatalf("status = %s, want %s", status.Status, StatusFailed)
+	if status.Status != StatusHealthy {
+		t.Fatalf("status = %s, want %s", status.Status, StatusHealthy)
 	}
-	if !strings.Contains(status.Error, "PRECHECK_PORT_CONFLICT") {
-		t.Fatalf("status error should contain PRECHECK_PORT_CONFLICT, got: %q", status.Error)
+	if status.PID <= 0 {
+		t.Fatalf("status pid = %d, want positive", status.PID)
+	}
+	if status.PID == foreignPID {
+		t.Fatalf("service should not reuse foreign pid %d", foreignPID)
 	}
 }
 
@@ -1508,7 +1507,7 @@ func TestRun_SuccessEstablishesOwnership(t *testing.T) {
 }
 
 func TestRun_RegressionMatrix(t *testing.T) {
-	t.Run("port conflict", func(t *testing.T) {
+	t.Run("port conflict cleaned", func(t *testing.T) {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("listen: %v", err)
@@ -1519,6 +1518,7 @@ func TestRun_RegressionMatrix(t *testing.T) {
 		}
 
 		healthURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+		command := fmt.Sprintf("python3 -m http.server %d", port)
 		foreignPID := startDetachedHTTPServer(t, port)
 		defer func() {
 			_ = syscall.Kill(foreignPID, syscall.SIGKILL)
@@ -1534,7 +1534,7 @@ func TestRun_RegressionMatrix(t *testing.T) {
 					Services: []Service{
 						{
 							Name:        "matrix-port-conflict",
-							Command:     "sleep 30",
+							Command:     command,
 							HealthCheck: HealthCheck{URL: healthURL},
 						},
 					},
@@ -1546,19 +1546,18 @@ func TestRun_RegressionMatrix(t *testing.T) {
 		}
 
 		err = runner.Run(context.Background(), true)
-		if err == nil {
-			t.Fatal("expected run to fail on foreign port conflict")
+		if err != nil {
+			t.Fatalf("expected run to succeed after port cleanup, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), domain.ServiceFailureCodePortConflict) {
-			t.Fatalf("error should contain %s, got: %v", domain.ServiceFailureCodePortConflict, err)
-		}
+		defer runner.Shutdown()
+		waitForProcessExit(t, foreignPID, 5*time.Second)
 
 		status := store.Get("matrix-port-conflict")
 		if status == nil {
 			t.Fatal("status should exist")
 		}
-		if status.FailureCode != domain.ServiceFailureCodePortConflict {
-			t.Fatalf("failure code = %q, want %q", status.FailureCode, domain.ServiceFailureCodePortConflict)
+		if status.Status != StatusHealthy {
+			t.Fatalf("status = %s, want %s", status.Status, StatusHealthy)
 		}
 	})
 
@@ -2301,6 +2300,23 @@ func waitForPortOpen(t *testing.T, port int, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("port %d did not open within %s", port, timeout)
+}
+
+func waitForProcessExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	if pid <= 0 {
+		t.Fatalf("invalid pid %d", pid)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			if err == syscall.ESRCH {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("pid %d still alive after %s", pid, timeout)
 }
 
 func startDetachedHTTPServer(t *testing.T, port int) int {

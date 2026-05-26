@@ -455,6 +455,9 @@ func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg He
 		}
 
 		if time.Now().After(deadline) {
+			if lastCheckErr != nil {
+				return fmt.Errorf("health check timed out after %ds (last error: %v)", cfg.Timeout, lastCheckErr)
+			}
 			return fmt.Errorf("health check timed out after %ds", cfg.Timeout)
 		}
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"runAll/src/domain"
 )
@@ -33,15 +35,37 @@ func (r *Runner) preflightService(ctx context.Context, svc Service) error {
 		}
 
 		sort.Ints(foreign)
-		msg := fmt.Sprintf(
-			"%s: service %s has foreign listeners on port %s (pid=%s)",
-			domain.ServiceFailureCodePortConflict,
-			svc.Name,
-			port,
-			joinPIDs(foreign),
-		)
-		r.store.RecordPreflightFailure(svc.Name, domain.ServiceFailureCodePortConflict, msg)
-		return fmt.Errorf("[%s] %s", svc.Name, msg)
+		logPIDs := joinPIDs(foreign)
+		if err := terminatePIDs(foreign); err != nil {
+			msg := fmt.Sprintf(
+				"%s: service %s failed to terminate foreign listeners on port %s (pid=%s): %v",
+				domain.ServiceFailureCodePortConflict,
+				svc.Name,
+				port,
+				logPIDs,
+				err,
+			)
+			r.store.RecordPreflightFailure(svc.Name, domain.ServiceFailureCodePortConflict, msg)
+			return fmt.Errorf("[%s] %s", svc.Name, msg)
+		}
+
+		remaining, err := listenerPIDs(port)
+		if err != nil {
+			return fmt.Errorf("[%s] preflight listener re-scan failed on port %s: %w", svc.Name, port, err)
+		}
+		remainingForeign := filterForeignPIDs(remaining, owned)
+		if len(remainingForeign) != 0 {
+			sort.Ints(remainingForeign)
+			msg := fmt.Sprintf(
+				"%s: service %s still has foreign listeners on port %s after cleanup (pid=%s)",
+				domain.ServiceFailureCodePortConflict,
+				svc.Name,
+				port,
+				joinPIDs(remainingForeign),
+			)
+			r.store.RecordPreflightFailure(svc.Name, domain.ServiceFailureCodePortConflict, msg)
+			return fmt.Errorf("[%s] %s", svc.Name, msg)
+		}
 	}
 	return nil
 }
@@ -85,4 +109,29 @@ func joinPIDs(pids []int) string {
 		parts = append(parts, fmt.Sprintf("%d", pid))
 	}
 	return strings.Join(parts, ",")
+}
+
+func terminatePIDs(pids []int) error {
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			return err
+		}
+	}
+
+	time.Sleep(250 * time.Millisecond)
+
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		if err := syscall.Kill(pid, 0); err == nil {
+			if killErr := syscall.Kill(pid, syscall.SIGKILL); killErr != nil && killErr != syscall.ESRCH {
+				return killErr
+			}
+		}
+	}
+	return nil
 }
