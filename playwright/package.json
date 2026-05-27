@@ -1,0 +1,11 @@
+{
+  "name": "runall-playwright",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:stop": "playwright test tests/runall-stop-vue-frontend.playwright.test.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

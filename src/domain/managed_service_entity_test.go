@@ -45,4 +45,18 @@ func TestManagedService_CanStart(t *testing.T) {
 	if healthy.CanStart() {
 		t.Fatal("healthy service should not be startable")
 	}
+
+	for _, status := range []string{
+		ServiceStatusFailed,
+		ServiceStatusSkipped,
+		ServiceStatusPending,
+	} {
+		service, err := NewManagedService("api", "platform", status, nil)
+		if err != nil {
+			t.Fatalf("NewManagedService(%q): %v", status, err)
+		}
+		if !service.CanStart() {
+			t.Fatalf("%q service should be startable", status)
+		}
+	}
 }

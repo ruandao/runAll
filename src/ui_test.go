@@ -12,6 +12,34 @@ import (
 	"runAll/src/domain"
 )
 
+func assertLifecycleAccepted(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if response["status"] != "accepted" {
+		t.Fatalf("status body = %#v, want status=accepted", response)
+	}
+}
+
+func waitForServiceStatus(t *testing.T, store *StatusStore, name string, want Status, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		status := store.Get(name)
+		if status != nil && status.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status := store.Get(name)
+	t.Fatalf("service %s status = %#v, want %q within %s", name, status, want, timeout)
+}
+
 func TestAPIStatus(t *testing.T) {
 	store := NewStatusStore()
 	store.Init([]string{"redis", "kafka"})
@@ -289,7 +317,10 @@ func TestUIHomePage(t *testing.T) {
 		`runAll Status`,
 		`const dotClass = {`,
 		`stopped: 'gray'`,
-		`const toggleAction = isStopped ? 'start' : 'stop';`,
+		`function fetchStatusData() {`,
+		`function isServiceStartable(status) {`,
+		`function getServiceStatus(name, data) {`,
+		`const toggleAction = startable ? 'start' : 'stop';`,
 		`data-action="stop-group"`,
 		`data-action="build"`,
 		`data-action="restart"`,
@@ -964,7 +995,7 @@ func TestAPIStopService(t *testing.T) {
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
 	})
 
-	t.Run("non owner rejected", func(t *testing.T) {
+	t.Run("non owner rejected when cascade false", func(t *testing.T) {
 		store.SetPID("svc-stop", 1234)
 		ownership, err := domain.NewServiceOwnership(
 			"svc-stop",
@@ -981,10 +1012,11 @@ func TestAPIStopService(t *testing.T) {
 			t.Fatalf("Save ownership: %v", err)
 		}
 
-		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"other-session"}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"other-session","cascade":false}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
-		assertJSONErrorMessage(t, rec, http.StatusBadRequest, `service "svc-stop" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, store, "svc-stop", StatusHealthy, 2*time.Second)
 	})
 
 	t.Run("success", func(t *testing.T) {
@@ -993,17 +1025,8 @@ func TestAPIStopService(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"svc-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]string
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("json decode: %v", err)
-		}
-		if response["status"] != "ok" {
-			t.Fatalf("status body = %#v, want status=ok", response)
-		}
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, store, "svc-stop", StatusStopped, 2*time.Second)
 	})
 }
 
@@ -1084,17 +1107,8 @@ func TestAPIStartService(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]string
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("json decode: %v", err)
-		}
-		if response["status"] != "ok" {
-			t.Fatalf("status body = %#v, want status=ok", response)
-		}
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, store, "svc-start", StatusHealthy, 5*time.Second)
 	})
 
 	t.Run("on_failure skip startup failure returns error", func(t *testing.T) {
@@ -1133,7 +1147,8 @@ func TestAPIStartService(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/start", strings.NewReader(`{"name":"svc-start-skip-fail","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		failMux.ServeHTTP(rec, req)
-		assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, failStore, "svc-start-skip-fail", StatusFailed, 5*time.Second)
 	})
 }
 
@@ -1172,7 +1187,8 @@ func TestAPIRestart_OnFailureSkipStartupFailureReturnsError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-skip-fail","session_id":"owner-session"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+	assertLifecycleAccepted(t, rec)
+	waitForServiceStatus(t, store, "svc-restart-skip-fail", StatusFailed, 5*time.Second)
 }
 
 func TestAPIRestart_RequiresSessionID(t *testing.T) {
@@ -1243,8 +1259,8 @@ func TestAPIRestart_NonOwnerRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/restart", strings.NewReader(`{"name":"svc-restart-owned","session_id":"other-session"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-
-	assertJSONErrorMessage(t, rec, http.StatusBadRequest, `service "svc-restart-owned" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
+	assertLifecycleAccepted(t, rec)
+	waitForServiceStatus(t, store, "svc-restart-owned", StatusHealthy, 2*time.Second)
 }
 
 func TestAPIStopGroup(t *testing.T) {
@@ -1312,7 +1328,8 @@ func TestAPIStopGroup(t *testing.T) {
 		assertJSONErrorMessage(t, rec, http.StatusBadRequest, expectedErr.Error())
 	})
 
-	t.Run("non owner rejected", func(t *testing.T) {
+	t.Run("non owner delegates to registered owner", func(t *testing.T) {
+		store.Update("svc-stop-group", StatusHealthy, "")
 		store.SetPID("svc-stop-group", 1234)
 		ownership, err := domain.NewServiceOwnership(
 			"svc-stop-group",
@@ -1332,7 +1349,8 @@ func TestAPIStopGroup(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop","session_id":"other-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
-		assertJSONErrorMessage(t, rec, http.StatusBadRequest, `stop group "g-stop" failed on "svc-stop-group": service "svc-stop-group" is owned by session "owner-session", actor session "other-session" requires explicit takeover`)
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, store, "svc-stop-group", StatusStopped, 2*time.Second)
 	})
 
 	t.Run("success", func(t *testing.T) {
@@ -1341,17 +1359,8 @@ func TestAPIStopGroup(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/stop-group", strings.NewReader(`{"group":"g-stop","session_id":"owner-session"}`))
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
-		}
-		var response map[string]string
-		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-			t.Fatalf("json decode: %v", err)
-		}
-		if response["status"] != "ok" {
-			t.Fatalf("status body = %#v, want status=ok", response)
-		}
+		assertLifecycleAccepted(t, rec)
+		waitForServiceStatus(t, store, "svc-stop-group", StatusStopped, 2*time.Second)
 	})
 }
 
@@ -1422,10 +1431,8 @@ func TestAPIStopService_CascadeFalseBlocksDownstream(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"a","session_id":"owner-session","cascade":false}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	assertJSONErrorResponse(t, rec, http.StatusBadRequest)
-	if !strings.Contains(rec.Body.String(), "active downstream dependencies") {
-		t.Fatalf("body = %s, want downstream block error", rec.Body.String())
-	}
+	assertLifecycleAccepted(t, rec)
+	waitForServiceStatus(t, store, "a", StatusHealthy, 2*time.Second)
 }
 
 func TestAPIStartGroup(t *testing.T) {
@@ -1459,7 +1466,6 @@ func TestAPIStartGroup(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/start-group", strings.NewReader(`{"group":"g-start","session_id":"owner-session"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
-	}
+	assertLifecycleAccepted(t, rec)
+	waitForServiceStatus(t, store, "svc-group-start", StatusHealthy, 5*time.Second)
 }

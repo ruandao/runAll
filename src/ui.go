@@ -4,7 +4,6 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -252,11 +251,14 @@ func handleServiceActionWithSession(
 		writeJSONError(w, "runner is required")
 		return
 	}
-	if err := action(r.Context(), body, sessionID); err != nil {
+	if err := validateLifecycleTarget(runner, fieldName, body); err != nil {
 		writeJSONError(w, err.Error())
 		return
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	runLifecycleActionAsync(func(ctx context.Context) error {
+		return action(ctx, body, sessionID)
+	}, fieldName, body)
+	writeLifecycleAccepted(w)
 }
 
 func handleCascadeServiceActionWithSession(
@@ -290,20 +292,50 @@ func handleCascadeServiceActionWithSession(
 		writeJSONError(w, "runner is required")
 		return
 	}
+	if err := validateLifecycleTarget(runner, fieldName, body); err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
 	action := cascadeAction
 	if !readCascadeFlag(payload) {
 		action = singleAction
 	}
-	if err := action(r.Context(), body, sessionID); err != nil {
-		var cascadeErr *CascadeFailure
-		if errors.As(err, &cascadeErr) {
-			writeCascadeError(w, cascadeErr)
-			return
+	runLifecycleActionAsync(func(ctx context.Context) error {
+		return action(ctx, body, sessionID)
+	}, fieldName, body)
+	writeLifecycleAccepted(w)
+}
+
+func validateLifecycleTarget(runner *Runner, fieldName, body string) error {
+	switch fieldName {
+	case "name":
+		if runner.findService(body) == nil {
+			return fmt.Errorf("service %q not found", body)
 		}
-		writeJSONError(w, err.Error())
-		return
+	case "group":
+		for _, group := range runner.cfg.Groups {
+			if group.Name == body {
+				return nil
+			}
+		}
+		return fmt.Errorf("group %q not found", body)
+	default:
+		return fmt.Errorf("unsupported lifecycle target %q", fieldName)
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	return nil
+}
+
+func runLifecycleActionAsync(action func(context.Context) error, fieldName, body string) {
+	go func() {
+		if err := action(context.Background()); err != nil {
+			log.Printf("[ui] async %s %q failed: %v", fieldName, body, err)
+		}
+	}()
+}
+
+func writeLifecycleAccepted(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]string{"status": "accepted"})
 }
 
 func readCascadeFlag(payload map[string]any) bool {

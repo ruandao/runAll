@@ -1967,8 +1967,46 @@ func TestRunner_StartService_RejectsNonStoppedStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected start to be rejected for non-stopped status")
 	}
-	if !strings.Contains(err.Error(), "can only start stopped") {
+	if !strings.Contains(err.Error(), "can only start idle") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StartService_AllowsFailedStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	hc := HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}}
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{Name: "failed-start", Command: "sleep 30", HealthCheck: hc},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	stubNoPortListenersForTest(runner)
+	store.Update("failed-start", StatusFailed, "previous health failure")
+
+	if err := runner.StartService(context.Background(), "failed-start"); err != nil {
+		t.Fatalf("StartService from failed: %v", err)
+	}
+	status := store.Get("failed-start")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", status)
+	}
+
+	if err := runner.StopService(context.Background(), "failed-start"); err != nil {
+		t.Fatalf("cleanup StopService: %v", err)
 	}
 }
 
@@ -3075,6 +3113,157 @@ func TestRunner_StopServiceCascade_StopsDownstreamFirst(t *testing.T) {
 		status := store.Get(name)
 		if status == nil || status.Status != StatusStopped {
 			t.Fatalf("service %s status = %#v, want stopped", name, status)
+		}
+	}
+}
+
+func TestRunner_StopServiceCascade_DelegatesOwnershipPerStep(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{Name: "git-oauth", Command: "echo git-oauth", HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "saas-backend", Command: "echo saas-backend", DependsOn: []string{"git-oauth"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "vue-frontend", Command: "echo vue-frontend", DependsOn: []string{"saas-backend"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	for _, name := range []string{"git-oauth", "saas-backend", "vue-frontend"} {
+		store.Update(name, StatusHealthy, "")
+	}
+
+	saveOwnership := func(serviceName, ownerSession string) {
+		t.Helper()
+		ownership, err := domain.NewServiceOwnership(
+			serviceName,
+			ownerSession,
+			1234,
+			"config-hash",
+			"http://127.0.0.1:1",
+			time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("NewServiceOwnership(%s): %v", serviceName, err)
+		}
+		if err := runner.ownershipRepo.Save(ownership); err != nil {
+			t.Fatalf("Save ownership(%s): %v", serviceName, err)
+		}
+	}
+	saveOwnership("vue-frontend", defaultOwnershipSessionID)
+	saveOwnership("saas-backend", defaultOwnershipSessionID)
+	saveOwnership("git-oauth", "ui-session")
+
+	if err := runner.StopServiceCascadeWithActor(context.Background(), "git-oauth", "ui-session"); err != nil {
+		t.Fatalf("StopServiceCascadeWithActor: %v", err)
+	}
+	for _, name := range []string{"git-oauth", "saas-backend", "vue-frontend"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusStopped {
+			t.Fatalf("service %s status = %#v, want stopped", name, status)
+		}
+	}
+}
+
+func TestRunner_StopServiceCascade_StopsFailedDownstreamBeforeUpstream(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "platform",
+				Services: []Service{
+					{Name: "git-oauth", Command: "echo git-oauth", HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "saas-backend", Command: "echo saas-backend", DependsOn: []string{"git-oauth"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "vue-frontend", Command: "echo vue-frontend", DependsOn: []string{"saas-backend"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "ai-provider", Command: "echo ai-provider", DependsOn: []string{"saas-backend"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("git-oauth", StatusHealthy, "")
+	store.Update("saas-backend", StatusFailed, "health check failed")
+	store.SetPID("saas-backend", 4321)
+	store.Update("vue-frontend", StatusStopped, "")
+	store.Update("ai-provider", StatusHealthy, "")
+
+	saveOwnership := func(serviceName, ownerSession string) {
+		t.Helper()
+		ownership, err := domain.NewServiceOwnership(
+			serviceName,
+			ownerSession,
+			1234,
+			"config-hash",
+			"http://127.0.0.1:1",
+			time.Now(),
+		)
+		if err != nil {
+			t.Fatalf("NewServiceOwnership(%s): %v", serviceName, err)
+		}
+		if err := runner.ownershipRepo.Save(ownership); err != nil {
+			t.Fatalf("Save ownership(%s): %v", serviceName, err)
+		}
+	}
+	saveOwnership("ai-provider", defaultOwnershipSessionID)
+	saveOwnership("saas-backend", defaultOwnershipSessionID)
+	saveOwnership("git-oauth", "ui-session")
+
+	if err := runner.StopServiceCascadeWithActor(context.Background(), "git-oauth", "ui-session"); err != nil {
+		t.Fatalf("StopServiceCascadeWithActor: %v", err)
+	}
+	for _, name := range []string{"git-oauth", "saas-backend", "ai-provider"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusStopped {
+			t.Fatalf("service %s status = %#v, want stopped", name, status)
+		}
+	}
+}
+
+func TestRunner_StartServiceCascade_StartsPendingChain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	hc := HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}}
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "platform",
+				Services: []Service{
+					{Name: "git-oauth", Command: "echo git-oauth", HealthCheck: hc},
+					{Name: "saas-backend", Command: "echo saas-backend", DependsOn: []string{"git-oauth"}, HealthCheck: hc},
+					{Name: "vue-frontend", Command: "echo vue-frontend", DependsOn: []string{"saas-backend"}, HealthCheck: hc},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	stubNoPortListenersForTest(runner)
+	store.Update("git-oauth", StatusHealthy, "")
+	store.Update("saas-backend", StatusPending, "")
+	store.Update("vue-frontend", StatusPending, "")
+
+	if err := runner.StartServiceCascadeWithActor(context.Background(), "vue-frontend", "ui-session"); err != nil {
+		t.Fatalf("StartServiceCascadeWithActor: %v", err)
+	}
+	for _, name := range []string{"saas-backend", "vue-frontend"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusHealthy {
+			t.Fatalf("service %s status = %#v, want healthy", name, status)
 		}
 	}
 }

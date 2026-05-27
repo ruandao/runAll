@@ -45,6 +45,38 @@ func TestServiceCascadeOrchestrationService_PlanStartCascade(t *testing.T) {
 	}
 }
 
+func TestServiceCascadeOrchestrationService_PlanStartCascade_IncludesPendingUpstream(t *testing.T) {
+	topology := &inMemoryServiceTopologyRepository{
+		nodes: []ServiceTopologyNode{
+			{Name: "git-oauth", DependsOn: nil},
+			{Name: "saas-backend", DependsOn: []string{"git-oauth"}},
+			{Name: "vue-frontend", DependsOn: []string{"saas-backend"}},
+		},
+	}
+	runtime := &inMemoryServiceRuntimeContextRepository{
+		services: []ManagedService{
+			{Name: "git-oauth", Status: ServiceStatusHealthy},
+			{Name: "saas-backend", Status: ServiceStatusPending},
+			{Name: "vue-frontend", Status: ServiceStatusPending},
+		},
+	}
+	service := NewServiceCascadeOrchestrationService(topology, runtime)
+
+	plan, err := service.PlanStartCascade("vue-frontend")
+	if err != nil {
+		t.Fatalf("PlanStartCascade: %v", err)
+	}
+	want := []string{"saas-backend", "vue-frontend"}
+	if len(plan.OrderedNames) != len(want) {
+		t.Fatalf("ordered names = %#v, want %#v", plan.OrderedNames, want)
+	}
+	for i, name := range want {
+		if plan.OrderedNames[i] != name {
+			t.Fatalf("ordered names = %#v, want %#v", plan.OrderedNames, want)
+		}
+	}
+}
+
 func TestServiceCascadeOrchestrationService_PlanStartCascade_SkipsHealthyUpstream(t *testing.T) {
 	topology := &inMemoryServiceTopologyRepository{
 		nodes: []ServiceTopologyNode{
@@ -69,6 +101,40 @@ func TestServiceCascadeOrchestrationService_PlanStartCascade_SkipsHealthyUpstrea
 	want := []string{"b", "c"}
 	if len(plan.OrderedNames) != len(want) {
 		t.Fatalf("ordered names = %#v, want %#v", plan.OrderedNames, want)
+	}
+}
+
+func TestServiceCascadeOrchestrationService_PlanStopCascade_IncludesFailedDownstream(t *testing.T) {
+	topology := &inMemoryServiceTopologyRepository{
+		nodes: []ServiceTopologyNode{
+			{Name: "git-oauth", DependsOn: nil},
+			{Name: "saas-backend", DependsOn: []string{"git-oauth"}},
+			{Name: "vue-frontend", DependsOn: []string{"saas-backend"}},
+			{Name: "ai-provider", DependsOn: []string{"saas-backend"}},
+		},
+	}
+	runtime := &inMemoryServiceRuntimeContextRepository{
+		services: []ManagedService{
+			{Name: "git-oauth", Status: ServiceStatusHealthy},
+			{Name: "saas-backend", Status: ServiceStatusFailed},
+			{Name: "vue-frontend", Status: ServiceStatusStopped},
+			{Name: "ai-provider", Status: ServiceStatusHealthy},
+		},
+	}
+	service := NewServiceCascadeOrchestrationService(topology, runtime)
+
+	plan, err := service.PlanStopCascade("git-oauth")
+	if err != nil {
+		t.Fatalf("PlanStopCascade: %v", err)
+	}
+	want := []string{"ai-provider", "saas-backend", "git-oauth"}
+	if len(plan.OrderedNames) != len(want) {
+		t.Fatalf("ordered names = %#v, want %#v", plan.OrderedNames, want)
+	}
+	for i, name := range want {
+		if plan.OrderedNames[i] != name {
+			t.Fatalf("ordered names = %#v, want %#v", plan.OrderedNames, want)
+		}
 	}
 }
 

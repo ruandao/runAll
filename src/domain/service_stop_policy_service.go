@@ -58,3 +58,17 @@ func isBlockingStatus(status string) bool {
 		return false
 	}
 }
+
+// isCascadeStopCandidateStatus reports whether a downstream service should appear
+// in a cascade stop plan. Failed services may still hold a live process/PID and
+// must be stopped before their upstream dependency can shut down.
+func isCascadeStopCandidateStatus(status string) bool {
+	switch status {
+	case ServiceStatusStopped, ServiceStatusSkipped, ServiceStatusPending:
+		return false
+	case ServiceStatusFailed:
+		return true
+	default:
+		return isBlockingStatus(status)
+	}
+}

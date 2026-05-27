@@ -875,6 +875,19 @@ func (r *Runner) StartGroupWithActor(ctx context.Context, group string, actorSes
 	})
 }
 
+func (r *Runner) resolveCascadeStepActor(serviceName, initiatingActor string) string {
+	initiating := strings.TrimSpace(initiatingActor)
+	if initiating == "" || r.ownershipRepo == nil {
+		return initiating
+	}
+	ownership, err := r.ownershipRepo.FindByServiceName(serviceName)
+	if err != nil {
+		return initiating
+	}
+	hasOwnership := ownership.ServiceName != ""
+	return domain.NewCascadeStepActorResolver().Resolve(initiating, ownership, hasOwnership)
+}
+
 func (r *Runner) executeLifecyclePlan(
 	ctx context.Context,
 	plan domain.ServiceLifecyclePlan,
@@ -888,7 +901,8 @@ func (r *Runner) executeLifecyclePlan(
 			return ctx.Err()
 		default:
 		}
-		if err := stepFn(ctx, serviceName, actor); err != nil {
+		stepActor := r.resolveCascadeStepActor(serviceName, actor)
+		if err := stepFn(ctx, serviceName, stepActor); err != nil {
 			if len(completed) == 0 {
 				return err
 			}
@@ -902,6 +916,15 @@ func (r *Runner) executeLifecyclePlan(
 		completed = append(completed, serviceName)
 	}
 	return nil
+}
+
+func (r *Runner) transitionServiceToStarting(name string) (Status, bool) {
+	for _, from := range []Status{StatusStopped, StatusFailed, StatusSkipped, StatusPending} {
+		if r.store.CompareAndSwapStatus(name, from, StatusStarting) {
+			return from, true
+		}
+	}
+	return "", false
 }
 
 func (r *Runner) startService(ctx context.Context, name string) error {
@@ -919,15 +942,21 @@ func (r *Runner) startService(ctx context.Context, name string) error {
 		return err
 	}
 	if !managedService.CanStart() {
-		return fmt.Errorf("service %q is %s, can only start stopped services", name, current.Status)
+		return fmt.Errorf("service %q is %s, can only start idle services", name, current.Status)
 	}
 
-	if !r.store.CompareAndSwapStatus(name, StatusStopped, StatusStarting) {
+	previousStatus, ok := r.transitionServiceToStarting(name)
+	if !ok {
 		latest := r.store.Get(name)
 		if latest == nil {
 			return fmt.Errorf("service %q not found", name)
 		}
-		return fmt.Errorf("service %q is %s, can only start stopped services", name, latest.Status)
+		return fmt.Errorf("service %q is %s, can only start idle services", name, latest.Status)
+	}
+	if previousStatus != StatusStopped {
+		r.stopMonitoring(name)
+		_ = r.stopProcess(name)
+		r.store.SetPID(name, 0)
 	}
 
 	if err := r.runPreflight(ctx, *svc); err != nil {
@@ -1021,7 +1050,8 @@ func (r *Runner) StopGroupWithActor(ctx context.Context, group string, actorSess
 		return fmt.Errorf("actor session id is required")
 	}
 	return r.stopGroup(ctx, group, func(stopCtx context.Context, serviceName string) error {
-		return r.StopServiceWithActor(stopCtx, serviceName, actor)
+		stepActor := r.resolveCascadeStepActor(serviceName, actor)
+		return r.StopServiceWithActor(stopCtx, serviceName, stepActor)
 	})
 }
 

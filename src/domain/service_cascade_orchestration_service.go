@@ -133,7 +133,7 @@ func (s *ServiceCascadeOrchestrationService) filterStartable(order []string) ([]
 		if err != nil {
 			return nil, err
 		}
-		if managed.Status == ServiceStatusStopped {
+		if IsStartableServiceStatus(managed.Status) {
 			filtered = append(filtered, name)
 		}
 	}
@@ -151,7 +151,7 @@ func (s *ServiceCascadeOrchestrationService) filterStoppable(order []string, tar
 		if err != nil {
 			return nil, err
 		}
-		if isBlockingStatus(managed.Status) {
+		if isCascadeStopCandidateStatus(managed.Status) {
 			filtered = append(filtered, name)
 		}
 	}

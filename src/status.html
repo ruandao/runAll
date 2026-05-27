@@ -124,65 +124,80 @@ const layoutState = {
   resizing: false,
 };
 const clickFeedbackTimers = new WeakMap();
+const lifecyclePollMs = 1000;
+const lifecyclePollTimeoutMs = 8000;
+let lastStatusData = [];
+let statusFetchInFlight = null;
+let lifecyclePollToken = 0;
 
-function pulseClickFeedback(buttonEl) {
-  if (!buttonEl) {
-    return;
-  }
-  const oldTimer = clickFeedbackTimers.get(buttonEl);
-  if (oldTimer) {
-    clearTimeout(oldTimer);
-  }
-  buttonEl.classList.remove('is-clicked');
-  // Force a reflow so fast repeated clicks still retrigger the animation.
-  void buttonEl.offsetWidth;
-  buttonEl.classList.add('is-clicked');
-  const timerId = setTimeout(() => {
-    buttonEl.classList.remove('is-clicked');
-    clickFeedbackTimers.delete(buttonEl);
-  }, clickFeedbackDurationMs);
-  clickFeedbackTimers.set(buttonEl, timerId);
+function isServiceStartable(status) {
+  return status === 'stopped'
+    || status === 'failed'
+    || status === 'skipped'
+    || status === 'pending';
 }
 
-async function refresh() {
-  try {
+function getServiceStatus(name, data) {
+  const rows = Array.isArray(data) ? data : lastStatusData;
+  const match = rows.find((item) => item && item.name === name);
+  return match && typeof match.status === 'string' ? match.status : '';
+}
+
+async function fetchStatusData() {
+  if (statusFetchInFlight) {
+    return statusFetchInFlight;
+  }
+  statusFetchInFlight = (async () => {
     const resp = await fetch('/api/status');
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const data = await resp.json();
-    const container = document.getElementById('services');
-    let html = '';
-    const byGroup = new Map();
-    for (const svc of data) {
-      const groupName = typeof svc.group === 'string' ? svc.group.trim() : '';
-      const groupKey = groupName || 'ungrouped';
-      if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
-      byGroup.get(groupKey).push(svc);
+    if (!resp.ok) {
+      throw new Error('HTTP ' + resp.status);
     }
+    const data = await resp.json();
+    if (!Array.isArray(data)) {
+      throw new Error('invalid status payload');
+    }
+    return data;
+  })().finally(() => {
+    statusFetchInFlight = null;
+  });
+  return statusFetchInFlight;
+}
 
-    const sortedGroups = [...byGroup.entries()].sort((a, b) => {
-      if (a[0] === 'ungrouped') return 1;
-      if (b[0] === 'ungrouped') return -1;
-      return a[0].localeCompare(b[0]);
+function renderStatus(data) {
+  const container = document.getElementById('services');
+  let html = '';
+  const byGroup = new Map();
+  for (const svc of data) {
+    const groupName = typeof svc.group === 'string' ? svc.group.trim() : '';
+    const groupKey = groupName || 'ungrouped';
+    if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
+    byGroup.get(groupKey).push(svc);
+  }
+
+  const sortedGroups = [...byGroup.entries()].sort((a, b) => {
+    if (a[0] === 'ungrouped') return 1;
+    if (b[0] === 'ungrouped') return -1;
+    return a[0].localeCompare(b[0]);
+  });
+
+  for (const [groupKey, services] of sortedGroups) {
+    const groupActions = groupKey !== 'ungrouped'
+      ? ` <button class="action-btn" type="button" data-action="start-group" data-group="${esc(groupKey)}">启动本组</button>`
+        + ` <button class="action-btn" type="button" data-action="stop-group" data-group="${esc(groupKey)}">关闭本组</button>`
+      : '';
+    const title = groupKey === 'ungrouped' ? 'Ungrouped' : `Group ${groupKey}`;
+    html += `<div class="level-header">${esc(title)}${groupActions}</div>`;
+    const sortedServices = [...services].sort((a, b) => {
+      const depthA = a.depends_on ? a.depends_on.length : 0;
+      const depthB = b.depends_on ? b.depends_on.length : 0;
+      if (depthA !== depthB) return depthA - depthB;
+      return String(a.name || '').localeCompare(String(b.name || ''));
     });
-
-    for (const [groupKey, services] of sortedGroups) {
-      const groupActions = groupKey !== 'ungrouped'
-        ? ` <button class="action-btn" type="button" data-action="start-group" data-group="${esc(groupKey)}">启动本组</button>`
-          + ` <button class="action-btn" type="button" data-action="stop-group" data-group="${esc(groupKey)}">关闭本组</button>`
-        : '';
-      const title = groupKey === 'ungrouped' ? 'Ungrouped' : `Group ${groupKey}`;
-      html += `<div class="level-header">${esc(title)}${groupActions}</div>`;
-      const sortedServices = [...services].sort((a, b) => {
-        const depthA = a.depends_on ? a.depends_on.length : 0;
-        const depthB = b.depends_on ? b.depends_on.length : 0;
-        if (depthA !== depthB) return depthA - depthB;
-        return String(a.name || '').localeCompare(String(b.name || ''));
-      });
-      for (const svc of sortedServices) {
+    for (const svc of sortedServices) {
       const cls = dotClass[svc.status] || 'gray';
-      const isStopped = svc.status === 'stopped';
-      const toggleAction = isStopped ? 'start' : 'stop';
-      const toggleLabel = isStopped ? '启动' : '关闭';
+      const startable = isServiceStartable(svc.status);
+      const toggleAction = startable ? 'start' : 'stop';
+      const toggleLabel = startable ? '启动' : '关闭';
       const sessionID = typeof svc.session_id === 'string' ? svc.session_id.trim() : '';
       const healthPort = normalizePortValue(svc.health_port);
       const commandPort = normalizePortValue(svc.command_port);
@@ -215,12 +230,38 @@ async function refresh() {
         html += `<span class="last-checked">checked: ${formatTime(svc.last_checked)}</span>`;
       }
       html += `</div>`;
-      }
     }
-    container.innerHTML = html;
+  }
+  container.innerHTML = html;
 
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  document.getElementById('uptime').textContent = `Uptime: ${elapsed}s`;
+}
+
+function pulseClickFeedback(buttonEl) {
+  if (!buttonEl) {
+    return;
+  }
+  const oldTimer = clickFeedbackTimers.get(buttonEl);
+  if (oldTimer) {
+    clearTimeout(oldTimer);
+  }
+  buttonEl.classList.remove('is-clicked');
+  // Force a reflow so fast repeated clicks still retrigger the animation.
+  void buttonEl.offsetWidth;
+  buttonEl.classList.add('is-clicked');
+  const timerId = setTimeout(() => {
+    buttonEl.classList.remove('is-clicked');
+    clickFeedbackTimers.delete(buttonEl);
+  }, clickFeedbackDurationMs);
+  clickFeedbackTimers.set(buttonEl, timerId);
+}
+
+async function refresh() {
+  try {
+    const data = await fetchStatusData();
+    lastStatusData = data;
+    renderStatus(data);
   } catch (err) {
     // Keep showing last successful state; update uptime only
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -292,8 +333,26 @@ function selectActorSessionID(explicitSessionID) {
   return getSessionID();
 }
 
+async function pollLifecycleStatus(name, expectStartable) {
+  const token = ++lifecyclePollToken;
+  const deadline = Date.now() + lifecyclePollTimeoutMs;
+  while (Date.now() < deadline) {
+    if (token !== lifecyclePollToken) {
+      return true;
+    }
+    await refresh();
+    const status = getServiceStatus(name);
+    if (status && isServiceStartable(status) === expectStartable) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, lifecyclePollMs));
+  }
+  return false;
+}
+
 async function postServiceAction(url, name, label, includeSession, explicitSessionID) {
   try {
+    const previousStatus = getServiceStatus(name);
     const payload = {name: name, cascade: true};
     if (includeSession) {
       payload.session_id = selectActorSessionID(explicitSessionID);
@@ -308,7 +367,23 @@ async function postServiceAction(url, name, label, includeSession, explicitSessi
       alert(formatActionFailure(label, result));
       return;
     }
-    refresh();
+    if (result.status === 'accepted' || result.status === 'ok') {
+      const expectStartable = url.includes('/api/stop')
+        ? true
+        : url.includes('/api/start')
+          ? false
+          : isServiceStartable(previousStatus);
+      if (name && (url.includes('/api/stop') || url.includes('/api/start'))) {
+        const settled = await pollLifecycleStatus(name, expectStartable);
+        if (!settled) {
+          alert(`${label} 已提交，但 ${name} 状态未在 ${lifecyclePollTimeoutMs / 1000}s 内更新；请查看 runAll 日志或服务行错误信息`);
+        }
+        return;
+      }
+      refresh();
+      return;
+    }
+    alert(formatActionFailure(label, result));
   } catch (err) {
     alert(`${label} failed: ` + err.message);
   }
@@ -341,7 +416,11 @@ async function postGroupAction(url, group, label) {
       alert(`${label} failed: ` + (result.error || `${resp.status}`));
       return;
     }
-    refresh();
+    if (result.status === 'accepted' || result.status === 'ok') {
+      refresh();
+      return;
+    }
+    alert(`${label} failed: unexpected response`);
   } catch (err) {
     alert(`${label} failed: ` + err.message);
   }

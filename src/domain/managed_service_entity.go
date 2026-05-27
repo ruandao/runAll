@@ -44,7 +44,17 @@ func NewManagedService(name, groupName, status string, dependsOn []string) (Mana
 }
 
 func (s ManagedService) CanStart() bool {
-	return s.Status == ServiceStatusStopped
+	return IsStartableServiceStatus(s.Status)
+}
+
+// IsStartableServiceStatus reports whether a service is idle enough to launch.
+func IsStartableServiceStatus(status string) bool {
+	switch status {
+	case ServiceStatusStopped, ServiceStatusFailed, ServiceStatusSkipped, ServiceStatusPending:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s ManagedService) CanStop(activeDependents []string) error {
