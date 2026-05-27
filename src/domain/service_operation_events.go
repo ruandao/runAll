@@ -44,3 +44,29 @@ type ServiceGroupStopRequested struct {
 	GroupName  string
 	OccurredAt time.Time
 }
+
+type ServiceCascadeStartRequested struct {
+	TargetServiceName string
+	PlannedOrder      []string
+	OccurredAt        time.Time
+}
+
+type ServiceCascadeStopRequested struct {
+	TargetServiceName string
+	PlannedOrder      []string
+	OccurredAt        time.Time
+}
+
+type ServiceGroupStartRequested struct {
+	GroupName    string
+	PlannedOrder []string
+	OccurredAt   time.Time
+}
+
+type ServiceCascadeStepFailed struct {
+	Operation string
+	FailedAt  string
+	Completed []string
+	Error     string
+	OccurredAt time.Time
+}

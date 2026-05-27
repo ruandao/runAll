@@ -2986,3 +2986,173 @@ func TestRunner_StartServiceWithActor_CleansForeignPortConflict(t *testing.T) {
 		t.Fatalf("cleanup StopServiceWithActor: %v", err)
 	}
 }
+
+func TestRunner_StartServiceCascade_StartsUpstreamFirst(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{
+						Name:        "a",
+						Command:     "sleep 30",
+						HealthCheck: HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}},
+					},
+					{
+						Name:        "b",
+						Command:     "sleep 30",
+						DependsOn:   []string{"a"},
+						HealthCheck: HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}},
+					},
+					{
+						Name:        "c",
+						Command:     "sleep 30",
+						DependsOn:   []string{"b"},
+						HealthCheck: HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}},
+					},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	stubNoPortListenersForTest(runner)
+	for _, name := range []string{"a", "b", "c"} {
+		store.Update(name, StatusStopped, "")
+	}
+
+	if err := runner.StartServiceCascadeWithActor(context.Background(), "c", "cascade-session"); err != nil {
+		t.Fatalf("StartServiceCascadeWithActor: %v", err)
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusHealthy {
+			t.Fatalf("service %s status = %#v, want healthy", name, status)
+		}
+	}
+
+	for _, name := range []string{"c", "b", "a"} {
+		if err := runner.StopServiceWithActor(context.Background(), name, "cascade-session"); err != nil {
+			t.Fatalf("cleanup StopServiceWithActor(%s): %v", name, err)
+		}
+	}
+}
+
+func TestRunner_StopServiceCascade_StopsDownstreamFirst(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{Name: "a", Command: "echo a", HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "b", Command: "echo b", DependsOn: []string{"a"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "c", Command: "echo c", DependsOn: []string{"b"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		store.Update(name, StatusHealthy, "")
+	}
+
+	if err := runner.StopServiceCascadeWithActor(context.Background(), "a", "cascade-session"); err != nil {
+		t.Fatalf("StopServiceCascadeWithActor: %v", err)
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusStopped {
+			t.Fatalf("service %s status = %#v, want stopped", name, status)
+		}
+	}
+}
+
+func TestRunner_StopService_BlocksWhenCascadeFalse(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "g1",
+				Services: []Service{
+					{Name: "a", Command: "echo a", HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+					{Name: "b", Command: "echo b", DependsOn: []string{"a"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("a", StatusHealthy, "")
+	store.Update("b", StatusHealthy, "")
+
+	err = runner.StopServiceWithActor(context.Background(), "a", "owner-session")
+	if err == nil {
+		t.Fatal("expected single stop to be blocked by active downstream")
+	}
+	if !strings.Contains(err.Error(), "active downstream dependencies") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunner_StartGroup_StartsStoppedServicesInOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	hc := HealthCheck{URL: srv.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}}
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{
+				Name: "infra",
+				Services: []Service{
+					{Name: "git-oauth", Command: "sleep 30", HealthCheck: hc},
+				},
+			},
+			{
+				Name: "platform",
+				Services: []Service{
+					{Name: "saas-backend", Command: "sleep 30", DependsOn: []string{"git-oauth"}, HealthCheck: hc},
+				},
+			},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	stubNoPortListenersForTest(runner)
+	store.Update("git-oauth", StatusStopped, "")
+	store.Update("saas-backend", StatusStopped, "")
+
+	if err := runner.StartGroupWithActor(context.Background(), "platform", "group-session"); err != nil {
+		t.Fatalf("StartGroupWithActor: %v", err)
+	}
+	for _, name := range []string{"git-oauth", "saas-backend"} {
+		status := store.Get(name)
+		if status == nil || status.Status != StatusHealthy {
+			t.Fatalf("service %s status = %#v, want healthy", name, status)
+		}
+	}
+
+	for _, name := range []string{"saas-backend", "git-oauth"} {
+		if err := runner.StopServiceWithActor(context.Background(), name, "group-session"); err != nil {
+			t.Fatalf("cleanup StopServiceWithActor(%s): %v", name, err)
+		}
+	}
+}

@@ -1364,11 +1364,12 @@ func assertJSONErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, wantS
 	if !strings.HasPrefix(contentType, "application/json") {
 		t.Fatalf("Content-Type = %q, want application/json", contentType)
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&body); err != nil {
 		t.Fatalf("json decode: %v", err)
 	}
-	if strings.TrimSpace(body["error"]) == "" {
+	errMsg, _ := body["error"].(string)
+	if strings.TrimSpace(errMsg) == "" {
 		t.Fatalf("error body = %#v, want non-empty error", body)
 	}
 }
@@ -1376,11 +1377,89 @@ func assertJSONErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, wantS
 func assertJSONErrorMessage(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int, wantMessage string) {
 	t.Helper()
 	assertJSONErrorResponse(t, rec, wantStatus)
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(strings.NewReader(rec.Body.String())).Decode(&body); err != nil {
 		t.Fatalf("json decode: %v", err)
 	}
-	if body["error"] != wantMessage {
-		t.Fatalf("error = %q, want %q", body["error"], wantMessage)
+	errMsg, _ := body["error"].(string)
+	if errMsg != wantMessage {
+		t.Fatalf("error = %q, want %q", errMsg, wantMessage)
+	}
+}
+
+func TestReadCascadeFlag(t *testing.T) {
+	if !readCascadeFlag(map[string]any{}) {
+		t.Fatal("expected default cascade true when field missing")
+	}
+	if readCascadeFlag(map[string]any{"cascade": false}) {
+		t.Fatal("expected cascade false")
+	}
+	if !readCascadeFlag(map[string]any{"cascade": true}) {
+		t.Fatal("expected cascade true")
+	}
+}
+
+func TestAPIStopService_CascadeFalseBlocksDownstream(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{Name: "a", Command: "echo a", HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+				{Name: "b", Command: "echo b", DependsOn: []string{"a"}, HealthCheck: HealthCheck{URL: "http://127.0.0.1:1"}},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("a", StatusHealthy, "")
+	store.Update("b", StatusHealthy, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/stop", strings.NewReader(`{"name":"a","session_id":"owner-session","cascade":false}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	assertJSONErrorResponse(t, rec, http.StatusBadRequest)
+	if !strings.Contains(rec.Body.String(), "active downstream dependencies") {
+		t.Fatalf("body = %s, want downstream block error", rec.Body.String())
+	}
+}
+
+func TestAPIStartGroup(t *testing.T) {
+	store := NewStatusStore()
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthServer.Close()
+
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g-start", Services: []Service{
+				{
+					Name:        "svc-group-start",
+					Command:     "sleep 30",
+					HealthCheck: HealthCheck{URL: healthServer.URL, Timeout: 2, Retries: 2, CheckInterval: 1, Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5}},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	stubNoPortListenersForTest(runner)
+	store.Update("svc-group-start", StatusStopped, "")
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/start-group", strings.NewReader(`{"group":"g-start","session_id":"owner-session"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
 }

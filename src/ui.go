@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -42,15 +43,27 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 	})
 
 	mux.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceActionWithSession(w, r, runner, "name", runner.StopServiceWithActor)
+		handleCascadeServiceActionWithSession(
+			w, r, runner, "name",
+			runner.StopServiceCascadeWithActor,
+			runner.StopServiceWithActor,
+		)
 	})
 
 	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
-		handleServiceActionWithSession(w, r, runner, "name", runner.StartServiceWithActor)
+		handleCascadeServiceActionWithSession(
+			w, r, runner, "name",
+			runner.StartServiceCascadeWithActor,
+			runner.StartServiceWithActor,
+		)
 	})
 
 	mux.HandleFunc("/api/stop-group", func(w http.ResponseWriter, r *http.Request) {
 		handleServiceActionWithSession(w, r, runner, "group", runner.StopGroupWithActor)
+	})
+
+	mux.HandleFunc("/api/start-group", func(w http.ResponseWriter, r *http.Request) {
+		handleServiceActionWithSession(w, r, runner, "group", runner.StartGroupWithActor)
 	})
 
 	mux.HandleFunc("/api/build", func(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +257,84 @@ func handleServiceActionWithSession(
 		return
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func handleCascadeServiceActionWithSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	runner *Runner,
+	fieldName string,
+	cascadeAction func(context.Context, string, string) error,
+	singleAction func(context.Context, string, string) error,
+) {
+	if r.Method != http.MethodPost {
+		writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	payload, err := readJSONPayload(r)
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	body, err := readRequiredStringField(payload, fieldName)
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	sessionID, err := readRequiredStringField(payload, "session_id")
+	if err != nil {
+		writeJSONError(w, err.Error())
+		return
+	}
+	if runner == nil {
+		writeJSONError(w, "runner is required")
+		return
+	}
+	action := cascadeAction
+	if !readCascadeFlag(payload) {
+		action = singleAction
+	}
+	if err := action(r.Context(), body, sessionID); err != nil {
+		var cascadeErr *CascadeFailure
+		if errors.As(err, &cascadeErr) {
+			writeCascadeError(w, cascadeErr)
+			return
+		}
+		writeJSONError(w, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func readCascadeFlag(payload map[string]any) bool {
+	raw, ok := payload["cascade"]
+	if !ok {
+		return true
+	}
+	value, ok := raw.(bool)
+	if !ok {
+		return true
+	}
+	return value
+}
+
+func writeCascadeError(w http.ResponseWriter, failure *CascadeFailure) {
+	message := "cascade failed"
+	if failure != nil && failure.Err != nil {
+		message = failure.Err.Error()
+	}
+	payload := map[string]any{"error": message}
+	if failure != nil {
+		payload["cascade"] = map[string]any{
+			"completed": failure.Report.Completed,
+			"failed_at": failure.Report.FailedAt,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("[ui] json encode error: %v", err)
+	}
 }
 
 func readStringFieldFromJSON(r *http.Request, fieldName string) (string, error) {

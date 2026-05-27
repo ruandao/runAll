@@ -166,9 +166,12 @@ async function refresh() {
     });
 
     for (const [groupKey, services] of sortedGroups) {
-      const stopGroupBtn = groupKey !== 'ungrouped' ? ` <button class="action-btn" type="button" data-action="stop-group" data-group="${esc(groupKey)}">关闭本组</button>` : '';
+      const groupActions = groupKey !== 'ungrouped'
+        ? ` <button class="action-btn" type="button" data-action="start-group" data-group="${esc(groupKey)}">启动本组</button>`
+          + ` <button class="action-btn" type="button" data-action="stop-group" data-group="${esc(groupKey)}">关闭本组</button>`
+        : '';
       const title = groupKey === 'ungrouped' ? 'Ungrouped' : `Group ${groupKey}`;
-      html += `<div class="level-header">${esc(title)}${stopGroupBtn}</div>`;
+      html += `<div class="level-header">${esc(title)}${groupActions}</div>`;
       const sortedServices = [...services].sort((a, b) => {
         const depthA = a.depends_on ? a.depends_on.length : 0;
         const depthB = b.depends_on ? b.depends_on.length : 0;
@@ -245,6 +248,10 @@ async function stopGroup(group) {
   await postGroupAction('/api/stop-group', group, 'Stop group');
 }
 
+async function startGroup(group) {
+  await postGroupAction('/api/start-group', group, 'Start group');
+}
+
 async function clearLogs(name) {
   try {
     const resp = await fetch('/api/logs/clear', {
@@ -287,7 +294,7 @@ function selectActorSessionID(explicitSessionID) {
 
 async function postServiceAction(url, name, label, includeSession, explicitSessionID) {
   try {
-    const payload = {name: name};
+    const payload = {name: name, cascade: true};
     if (includeSession) {
       payload.session_id = selectActorSessionID(explicitSessionID);
     }
@@ -298,13 +305,28 @@ async function postServiceAction(url, name, label, includeSession, explicitSessi
     });
     const result = await parseJsonSafe(resp);
     if (!resp.ok) {
-      alert(`${label} failed: ` + (result.error || `${resp.status}`));
+      alert(formatActionFailure(label, result));
       return;
     }
     refresh();
   } catch (err) {
     alert(`${label} failed: ` + err.message);
   }
+}
+
+function formatActionFailure(label, result) {
+  let message = `${label} failed: ` + (result.error || 'unknown error');
+  if (result.cascade && typeof result.cascade === 'object') {
+    const failedAt = result.cascade.failed_at || '';
+    const completed = Array.isArray(result.cascade.completed) ? result.cascade.completed.join(', ') : '';
+    if (failedAt) {
+      message += `\nfailed at: ${failedAt}`;
+    }
+    if (completed) {
+      message += `\ncompleted: ${completed}`;
+    }
+  }
+  return message;
 }
 
 async function postGroupAction(url, group, label) {
@@ -600,6 +622,10 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
   if (action === 'stop-group' && group) {
     stopGroup(group);
+    return;
+  }
+  if (action === 'start-group' && group) {
+    startGroup(group);
   }
 });
 

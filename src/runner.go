@@ -43,6 +43,26 @@ const (
 
 type actorSessionContextKey struct{}
 
+// CascadeFailure attaches partial cascade progress to an error for API responses.
+type CascadeFailure struct {
+	Err    error
+	Report domain.CascadeExecutionReport
+}
+
+func (e *CascadeFailure) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *CascadeFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type noopRuntimePrereqProbeRepository struct{}
 
 func (noopRuntimePrereqProbeRepository) Probe(service domain.ManagedService) error {
@@ -776,6 +796,112 @@ func (r *Runner) StartServiceWithActor(ctx context.Context, name string, actorSe
 		return err
 	}
 	return r.startService(withActorSessionID(ctx, actor), name)
+}
+
+func (r *Runner) cascadeOrchestration() *domain.ServiceCascadeOrchestrationService {
+	return domain.NewServiceCascadeOrchestrationService(
+		newConfigServiceTopologyRepository(r.cfg),
+		&runnerRuntimeContextRepository{runner: r},
+	)
+}
+
+func (r *Runner) StartServiceCascade(ctx context.Context, name string) error {
+	return r.StartServiceCascadeWithActor(ctx, name, defaultOwnershipSessionID)
+}
+
+func (r *Runner) StartServiceCascadeWithActor(ctx context.Context, name string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required")
+	}
+	plan, err := r.cascadeOrchestration().PlanStartCascade(name)
+	if err != nil {
+		return err
+	}
+	if len(plan.OrderedNames) == 0 {
+		current := r.store.Get(name)
+		if current != nil && current.Status == StatusHealthy {
+			return nil
+		}
+		return fmt.Errorf("no stopped services to start in cascade for %q", name)
+	}
+	log.Printf("[cascade] start plan: %s", plan.String())
+	return r.executeLifecyclePlan(ctx, plan, actor, func(stepCtx context.Context, serviceName, stepActor string) error {
+		return r.StartServiceWithActor(stepCtx, serviceName, stepActor)
+	})
+}
+
+func (r *Runner) StopServiceCascade(ctx context.Context, name string) error {
+	return r.StopServiceCascadeWithActor(ctx, name, defaultOwnershipSessionID)
+}
+
+func (r *Runner) StopServiceCascadeWithActor(ctx context.Context, name string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required")
+	}
+	plan, err := r.cascadeOrchestration().PlanStopCascade(name)
+	if err != nil {
+		return err
+	}
+	if len(plan.OrderedNames) == 0 {
+		return nil
+	}
+	log.Printf("[cascade] stop plan: %s", plan.String())
+	return r.executeLifecyclePlan(ctx, plan, actor, func(stepCtx context.Context, serviceName, stepActor string) error {
+		return r.StopServiceWithActor(stepCtx, serviceName, stepActor)
+	})
+}
+
+func (r *Runner) StartGroup(ctx context.Context, group string) error {
+	return r.StartGroupWithActor(ctx, group, defaultOwnershipSessionID)
+}
+
+func (r *Runner) StartGroupWithActor(ctx context.Context, group string, actorSessionID string) error {
+	actor := strings.TrimSpace(actorSessionID)
+	if actor == "" {
+		return fmt.Errorf("actor session id is required")
+	}
+	plan, err := r.cascadeOrchestration().PlanStartGroup(group)
+	if err != nil {
+		return err
+	}
+	if len(plan.OrderedNames) == 0 {
+		return nil
+	}
+	log.Printf("[cascade] start group %q plan: %s", group, plan.String())
+	return r.executeLifecyclePlan(ctx, plan, actor, func(stepCtx context.Context, serviceName, stepActor string) error {
+		return r.StartServiceWithActor(stepCtx, serviceName, stepActor)
+	})
+}
+
+func (r *Runner) executeLifecyclePlan(
+	ctx context.Context,
+	plan domain.ServiceLifecyclePlan,
+	actor string,
+	stepFn func(context.Context, string, string) error,
+) error {
+	completed := make([]string, 0, len(plan.OrderedNames))
+	for _, serviceName := range plan.OrderedNames {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := stepFn(ctx, serviceName, actor); err != nil {
+			if len(completed) == 0 {
+				return err
+			}
+			report, reportErr := domain.NewCascadeExecutionReport(completed, serviceName)
+			if reportErr != nil {
+				return fmt.Errorf("%s cascade failed on %q: %w", plan.Operation, serviceName, err)
+			}
+			wrapped := fmt.Errorf("%s cascade failed on %q: %w", plan.Operation, serviceName, err)
+			return &CascadeFailure{Err: wrapped, Report: report}
+		}
+		completed = append(completed, serviceName)
+	}
+	return nil
 }
 
 func (r *Runner) startService(ctx context.Context, name string) error {
