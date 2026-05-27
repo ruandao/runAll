@@ -51,6 +51,7 @@ groups:
             multiplier: 2.0
 
       - name: vue-frontend
+        build_command: "npm run build"
         command: "npm run dev"
         working_dir: ../task2app/front_project/app
         depends_on: [saas-backend]

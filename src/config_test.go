@@ -375,3 +375,29 @@ groups:
 		}
 	}
 }
+
+func TestProductionConfig_VueFrontendHasBuildCommand(t *testing.T) {
+	path := filepath.Join("..", "config.yaml")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig(%q): %v", path, err)
+	}
+
+	var vueFrontend *Service
+	for _, svc := range cfg.Flatten() {
+		if svc.Name == "vue-frontend" {
+			svcCopy := svc
+			vueFrontend = &svcCopy
+			break
+		}
+	}
+	if vueFrontend == nil {
+		t.Fatal("vue-frontend service not found in production config")
+	}
+	if vueFrontend.BuildCommand == "" {
+		t.Fatal("vue-frontend build_command must be configured for UI build action")
+	}
+	if vueFrontend.BuildCommand != "npm run build" {
+		t.Fatalf("build_command = %q, want %q", vueFrontend.BuildCommand, "npm run build")
+	}
+}
