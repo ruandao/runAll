@@ -168,13 +168,23 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 
 	ownershipRepo := infrastructure.NewInMemoryServiceOwnershipRepository()
 
+	logRepo := domain.ServiceLogRepository(infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity))
+	if fileRoot := strings.TrimSpace(cfg.Logging.FileRoot); fileRoot != "" {
+		fileSink, err := infrastructure.NewFileServiceLogSink(fileRoot)
+		if err != nil {
+			return nil, fmt.Errorf("file log sink: %w", err)
+		}
+		logRepo = infrastructure.NewTeeServiceLogRepository(logRepo, fileSink)
+		log.Printf("[runAll] logging to %s (RUNALL_LOG_ROOT / logging.file_root)", fileRoot)
+	}
+
 	return &Runner{
 		cfg:                          cfg,
 		store:                        store,
 		levels:                       levels,
 		processes:                    make(map[string]*exec.Cmd),
 		monitors:                     make(map[string]context.CancelFunc),
-		logRepository:                infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity),
+		logRepository:                logRepo,
 		ownershipRepo:                ownershipRepo,
 		ownershipGuard:               domain.NewServiceOwnershipGuardService(ownershipRepo),
 		runtimePrereqProbeRepository: noopRuntimePrereqProbeRepository{},

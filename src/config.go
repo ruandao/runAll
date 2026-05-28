@@ -14,7 +14,12 @@ import (
 
 type Config struct {
 	Version string  `yaml:"version"`
+	Logging Logging `yaml:"logging"`
 	Groups  []Group `yaml:"groups"`
+}
+
+type Logging struct {
+	FileRoot string `yaml:"file_root"`
 }
 
 type Group struct {
@@ -26,6 +31,7 @@ type Service struct {
 	Name         string            `yaml:"name"`
 	Command      string            `yaml:"command"`
 	BuildCommand string            `yaml:"build_command"` // optional, runs before restart
+	Language     string            `yaml:"language"`      // optional, shown in UI; auto-detected when empty
 	WorkingDir   string            `yaml:"working_dir"`
 	Env          map[string]string `yaml:"env"`
 	DependsOn    []string          `yaml:"depends_on"`
@@ -114,6 +120,7 @@ func fileSHA256(path string) (string, error) {
 }
 
 func (c *Config) fillDefaults() {
+	c.Logging.FileRoot = resolveLogFileRoot(c.Logging.FileRoot)
 	for gi := range c.Groups {
 		for si := range c.Groups[gi].Services {
 			svc := &c.Groups[gi].Services[si]
@@ -197,4 +204,11 @@ func (c *Config) Flatten() []Service {
 		result = append(result, g.Services...)
 	}
 	return result
+}
+
+func resolveLogFileRoot(configured string) string {
+	if env := strings.TrimSpace(os.Getenv("RUNALL_LOG_ROOT")); env != "" {
+		return env
+	}
+	return strings.TrimSpace(configured)
 }

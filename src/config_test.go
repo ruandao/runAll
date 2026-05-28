@@ -84,6 +84,59 @@ groups:
 	}
 }
 
+func TestLoadConfig_LoggingFileRoot(t *testing.T) {
+	yamlContent := `
+version: "1"
+logging:
+  file_root: /tmp/custom-runall-logs
+groups:
+  - name: infra
+    services:
+      - name: svc
+        command: "echo hi"
+        health_check:
+          url: "http://localhost:8080"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yamlContent), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Logging.FileRoot != "/tmp/custom-runall-logs" {
+		t.Errorf("file_root = %q, want /tmp/custom-runall-logs", cfg.Logging.FileRoot)
+	}
+}
+
+func TestLoadConfig_LoggingFileRootEnvOverride(t *testing.T) {
+	t.Setenv("RUNALL_LOG_ROOT", "/tmp/from-env")
+	yamlContent := `
+version: "1"
+logging:
+  file_root: /tmp/from-yaml
+groups:
+  - name: infra
+    services:
+      - name: svc
+        command: "echo hi"
+        health_check:
+          url: "http://localhost:8080"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yamlContent), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Logging.FileRoot != "/tmp/from-env" {
+		t.Errorf("file_root = %q, want env override /tmp/from-env", cfg.Logging.FileRoot)
+	}
+}
+
 func TestLoadConfig_DuplicateServiceNames(t *testing.T) {
 	yaml := `
 version: "1"
