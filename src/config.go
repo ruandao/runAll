@@ -25,6 +25,7 @@ type Logging struct {
 
 type Observability struct {
 	GrafanaURL        string `yaml:"grafana_url"`
+	LokiURL           string `yaml:"loki_url"`
 	TraceDashboardUID string `yaml:"trace_dashboard_uid"`
 }
 
@@ -224,8 +225,14 @@ func resolveObservability(o Observability) Observability {
 	if env := strings.TrimSpace(os.Getenv("GRAFANA_URL")); env != "" {
 		o.GrafanaURL = env
 	}
+	if env := strings.TrimSpace(os.Getenv("LOKI_URL")); env != "" {
+		o.LokiURL = env
+	}
 	if strings.TrimSpace(o.GrafanaURL) == "" {
 		o.GrafanaURL = "http://127.0.0.1:3000"
+	}
+	if strings.TrimSpace(o.LokiURL) == "" {
+		o.LokiURL = "http://127.0.0.1:3100"
 	}
 	if strings.TrimSpace(o.TraceDashboardUID) == "" {
 		o.TraceDashboardUID = "trace-log-journey"

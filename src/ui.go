@@ -166,10 +166,19 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 			return
 		}
 		obs := runner.cfg.Observability
-		writeJSON(w, map[string]string{
-			"grafana_url":          obs.GrafanaURL,
-			"trace_dashboard_uid":  obs.TraceDashboardUID,
-		})
+		lokiExplore, err := domain.GrafanaLokiExploreLink(obs.GrafanaURL)
+		if err != nil {
+			writeJSONError(w, err.Error())
+			return
+		}
+		payload := map[string]string{
+			"grafana_url":           obs.GrafanaURL,
+			"loki_url":              obs.LokiURL,
+			"grafana_loki_explore":  lokiExplore,
+			"trace_dashboard_uid":   obs.TraceDashboardUID,
+			"log_file_root":         strings.TrimSpace(runner.cfg.Logging.FileRoot),
+		}
+		writeJSON(w, payload)
 	})
 
 	mux.HandleFunc("/api/observability/grafana-trace", func(w http.ResponseWriter, r *http.Request) {

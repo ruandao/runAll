@@ -24,3 +24,19 @@ func TestGrafanaTraceLink(t *testing.T) {
 		}
 	}
 }
+
+func TestGrafanaLokiExploreLink(t *testing.T) {
+	link, err := GrafanaLokiExploreLink("http://127.0.0.1:3000")
+	if err != nil {
+		t.Fatalf("GrafanaLokiExploreLink: %v", err)
+	}
+	for _, part := range []string{
+		"/explore",
+		"loki",
+		"runall",
+	} {
+		if !strings.Contains(link, part) {
+			t.Fatalf("link %q missing %q", link, part)
+		}
+	}
+}

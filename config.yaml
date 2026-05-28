@@ -9,6 +9,7 @@ logging:
 
 observability:
   grafana_url: "http://127.0.0.1:3000"
+  loki_url: "http://127.0.0.1:3100"
   trace_dashboard_uid: trace-log-journey
 
 groups:

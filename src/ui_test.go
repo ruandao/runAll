@@ -390,11 +390,16 @@ func TestUIHomePage(t *testing.T) {
 		`data-action="restart"`,
 		`data-action="logs"`,
 		`data-action="clear-logs"`,
+		`id="logs-panel-loki"`,
 		`id="logs-panel-grafana"`,
 		`id="logs-panel-refresh"`,
 		`id="logs-panel-copy"`,
 		`function openGrafanaTraceLogs()`,
 		`function extractTraceIdFromLogRows(rows)`,
+		`id="observability-bar"`,
+		`loadObservabilityBar`,
+		`/api/observability`,
+		`function openLokiExplore()`,
 		`/api/observability/grafana-trace`,
 		`async function copyLogsToClipboard()`,
 		`navigator.clipboard.writeText`,
@@ -640,6 +645,55 @@ func TestAPILogs_Success(t *testing.T) {
 	}
 	if response.Lines[0].Message != "line-2" || response.Lines[1].Message != "line-3" {
 		t.Fatalf("unexpected log lines: %#v", response.Lines)
+	}
+}
+
+func TestAPIObservability_IncludesLoki(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Logging: Logging{FileRoot: "/tmp/runall-logs"},
+		Observability: Observability{
+			GrafanaURL:        "http://127.0.0.1:3000",
+			LokiURL:           "http://127.0.0.1:3100",
+			TraceDashboardUID: "trace-log-journey",
+		},
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "ai-monitor",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9995"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/observability", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response["loki_url"] != "http://127.0.0.1:3100" {
+		t.Fatalf("loki_url = %q", response["loki_url"])
+	}
+	if response["log_file_root"] != "/tmp/runall-logs" {
+		t.Fatalf("log_file_root = %q", response["log_file_root"])
+	}
+	if !strings.Contains(response["grafana_loki_explore"], "/explore") {
+		t.Fatalf("grafana_loki_explore = %q", response["grafana_loki_explore"])
 	}
 }
 

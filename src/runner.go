@@ -178,7 +178,12 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 			return nil, fmt.Errorf("file log sink: %w", err)
 		}
 		logRepo = infrastructure.NewTeeServiceLogRepository(logRepo, fileSink)
-		log.Printf("[runAll] logging to %s (RUNALL_LOG_ROOT / logging.file_root)", fileRoot)
+		log.Printf(
+			"[runAll] centralized logs: tee %s → Promtail (ai-monitor) → Loki %s → Grafana %s",
+			fileRoot,
+			strings.TrimSpace(cfg.Observability.LokiURL),
+			strings.TrimSpace(cfg.Observability.GrafanaURL),
+		)
 	}
 
 	return &Runner{

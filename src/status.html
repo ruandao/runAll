@@ -98,10 +98,22 @@
   .logs-panel-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
   .logs-content { margin: 0; padding: 12px 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow: auto; color: #dbeafe; min-height: 280px; flex: 1 1 auto; background: #020617; }
   .logs-placeholder { color: #94a3b8; }
+  .observability-bar {
+    display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; align-items: center;
+    margin: 0 0 1rem; padding: 0.65rem 0.85rem; border-radius: 8px;
+    background: #1e293b; color: #cbd5e1; font-size: 0.9rem;
+  }
+  .observability-bar a { color: #38bdf8; text-decoration: none; }
+  .observability-bar a:hover { text-decoration: underline; }
+  .observability-bar .obs-label { color: #94a3b8; margin-right: 0.25rem; }
 </style>
 </head>
 <body>
 <h1>runAll Status</h1>
+<div id="observability-bar" class="observability-bar" aria-label="Observability links">
+  <span class="obs-label">集中日志:</span>
+  <span>加载中…</span>
+</div>
 <div id="workspace" class="workspace">
   <section class="services-pane">
     <div class="subtitle">auto-refresh every 2s</div>
@@ -116,6 +128,7 @@
         <div id="logs-panel-meta" class="logs-panel-meta">last 200 lines, auto-refresh every 2s</div>
       </div>
       <div class="logs-panel-actions">
+        <button id="logs-panel-loki" class="logs-panel-btn" type="button">Loki</button>
         <button id="logs-panel-grafana" class="logs-panel-btn" type="button">Grafana</button>
         <button id="logs-panel-copy" class="logs-panel-btn" type="button">Copy</button>
         <button id="logs-panel-refresh" class="logs-panel-btn" type="button">Refresh</button>
@@ -554,6 +567,59 @@ function extractTraceIdFromLogRows(rows) {
   return '';
 }
 
+const observabilityState = {
+  grafanaUrl: '',
+  lokiUrl: '',
+  grafanaLokiExplore: '',
+  logFileRoot: '',
+};
+
+async function loadObservabilityBar() {
+  const bar = document.getElementById('observability-bar');
+  if (!bar) {
+    return;
+  }
+  try {
+    const resp = await fetch('/api/observability');
+    const data = await parseJsonSafe(resp);
+    if (!resp.ok) {
+      bar.innerHTML = '<span class="obs-label">集中日志:</span><span>未配置（启动 ai-monitor 服务）</span>';
+      return;
+    }
+    observabilityState.grafanaUrl = data.grafana_url || '';
+    observabilityState.lokiUrl = data.loki_url || '';
+    observabilityState.grafanaLokiExplore = data.grafana_loki_explore || '';
+    observabilityState.logFileRoot = data.log_file_root || '';
+    const parts = [
+      '<span class="obs-label">集中日志:</span>',
+      observabilityState.grafanaLokiExplore
+        ? `<a href="${observabilityState.grafanaLokiExplore}" target="_blank" rel="noopener noreferrer">Loki Explore</a>`
+        : '',
+      observabilityState.grafanaUrl
+        ? `<a href="${observabilityState.grafanaUrl}" target="_blank" rel="noopener noreferrer">Grafana</a>`
+        : '',
+      observabilityState.lokiUrl
+        ? `<span>Loki API <a href="${observabilityState.lokiUrl}/ready" target="_blank" rel="noopener noreferrer">${observabilityState.lokiUrl}</a></span>`
+        : '',
+      observabilityState.logFileRoot
+        ? `<span>tee → <code>${observabilityState.logFileRoot}</code> → Promtail (ai-monitor)</span>`
+        : '<span>tee 未启用（配置 logging.file_root）</span>',
+    ].filter(Boolean);
+    bar.innerHTML = parts.join(' · ');
+  } catch (err) {
+    bar.innerHTML = `<span class="obs-label">集中日志:</span><span>加载失败: ${err.message}</span>`;
+  }
+}
+
+function openLokiExplore() {
+  const url = observabilityState.grafanaLokiExplore || observabilityState.lokiUrl;
+  if (!url) {
+    alert('Loki 未配置。请确认 ai-monitor 服务已启动。');
+    return;
+  }
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
 async function openGrafanaTraceLogs() {
   if (!logsState.service) {
     alert('Select a service first.');
@@ -805,6 +871,10 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
 });
 
+document.getElementById('logs-panel-loki').addEventListener('click', (event) => {
+  pulseClickFeedback(event.currentTarget);
+  openLokiExplore();
+});
 document.getElementById('logs-panel-grafana').addEventListener('click', (event) => {
   pulseClickFeedback(event.currentTarget);
   openGrafanaTraceLogs();
@@ -838,6 +908,7 @@ window.addEventListener('resize', () => {
   }
 });
 
+loadObservabilityBar();
 refresh();
 setInterval(refresh, statusRefreshMs);
 </script>

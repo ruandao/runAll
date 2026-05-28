@@ -159,6 +159,9 @@ groups:
 	if cfg.Observability.GrafanaURL != "http://127.0.0.1:3000" {
 		t.Errorf("grafana_url = %q", cfg.Observability.GrafanaURL)
 	}
+	if cfg.Observability.LokiURL != "http://127.0.0.1:3100" {
+		t.Errorf("loki_url = %q", cfg.Observability.LokiURL)
+	}
 	if cfg.Observability.TraceDashboardUID != "trace-log-journey" {
 		t.Errorf("trace_dashboard_uid = %q", cfg.Observability.TraceDashboardUID)
 	}
