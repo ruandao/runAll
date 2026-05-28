@@ -1,6 +1,17 @@
 package domain
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestParseTraceId_TooLong(t *testing.T) {
+	long := strings.Repeat("a", 257)
+	_, err := ParseTraceId(long)
+	if err == nil {
+		t.Fatal("expected error for trace id over 256 chars")
+	}
+}
 
 func TestParseTraceId_Valid(t *testing.T) {
 	tid, err := ParseTraceId("test-trace-abc12345")

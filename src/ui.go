@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"runAll/src/domain"
 )
 
 //go:embed status.html
@@ -20,6 +22,8 @@ type serviceStatusPayload struct {
 	*ServiceStatus
 	Hint      string `json:"hint,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
+	Buildable bool   `json:"buildable"`
+	Language  string `json:"language"`
 }
 
 func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) {
@@ -152,6 +156,63 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
+	mux.HandleFunc("/api/observability", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if runner == nil || runner.cfg == nil {
+			writeJSONError(w, "runner is required")
+			return
+		}
+		obs := runner.cfg.Observability
+		writeJSON(w, map[string]string{
+			"grafana_url":          obs.GrafanaURL,
+			"trace_dashboard_uid":  obs.TraceDashboardUID,
+		})
+	})
+
+	mux.HandleFunc("/api/observability/grafana-trace", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if runner == nil || runner.cfg == nil {
+			writeJSONError(w, "runner is required")
+			return
+		}
+
+		traceID := strings.TrimSpace(r.URL.Query().Get("trace_id"))
+		serviceName := strings.TrimSpace(r.URL.Query().Get("service"))
+		if traceID == "" && serviceName != "" && runner.logRepository != nil {
+			entries := runner.logRepository.Tail(serviceName, 200)
+			for i := len(entries) - 1; i >= 0; i-- {
+				if tid := domain.ExtractTraceIDFromLogMessage(entries[i].Message); tid != "" {
+					traceID = tid
+					break
+				}
+			}
+		}
+		if traceID == "" {
+			writeJSONError(w, "trace_id is required (or provide service with trace logs)")
+			return
+		}
+
+		link, err := domain.GrafanaTraceLink(
+			runner.cfg.Observability.GrafanaURL,
+			runner.cfg.Observability.TraceDashboardUID,
+			traceID,
+		)
+		if err != nil {
+			writeJSONError(w, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{
+			"trace_id": traceID,
+			"url":      link,
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -179,11 +240,20 @@ func buildStatusPayload(store *StatusStore, runner *Runner) []serviceStatusPaylo
 	services := store.All()
 	result := make([]serviceStatusPayload, 0, len(services))
 	for _, svc := range services {
-		result = append(result, serviceStatusPayload{
+		payload := serviceStatusPayload{
 			ServiceStatus: svc,
 			Hint:          deriveFailureHint(svc),
-			SessionID:     resolveServiceSessionID(runner, svc.Name),
-		})
+			Buildable:     false,
+			Language:      "—",
+		}
+		if runner != nil {
+			payload.SessionID = resolveServiceSessionID(runner, svc.Name)
+			if cfgSvc := runner.findService(svc.Name); cfgSvc != nil {
+				payload.Buildable = serviceBuildable(cfgSvc)
+				payload.Language = detectServiceLanguage(*cfgSvc)
+			}
+		}
+		result = append(result, payload)
 	}
 	return result
 }

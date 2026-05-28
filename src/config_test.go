@@ -137,6 +137,33 @@ groups:
 	}
 }
 
+func TestLoadConfig_ObservabilityDefaults(t *testing.T) {
+	yamlContent := `
+version: "1"
+groups:
+  - name: infra
+    services:
+      - name: svc
+        command: "echo hi"
+        health_check:
+          url: "http://localhost:8080"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yamlContent), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Observability.GrafanaURL != "http://127.0.0.1:3000" {
+		t.Errorf("grafana_url = %q", cfg.Observability.GrafanaURL)
+	}
+	if cfg.Observability.TraceDashboardUID != "trace-log-journey" {
+		t.Errorf("trace_dashboard_uid = %q", cfg.Observability.TraceDashboardUID)
+	}
+}
+
 func TestLoadConfig_DuplicateServiceNames(t *testing.T) {
 	yaml := `
 version: "1"

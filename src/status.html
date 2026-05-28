@@ -15,6 +15,7 @@
   .service:hover { background: #1c2a4a; }
   .name { font-weight: 600; min-width: 140px; }
   .status { font-size: 13px; min-width: 80px; }
+  .language { font-size: 12px; color: #a5b4fc; min-width: 72px; }
   .deps { display: flex; gap: 8px; flex-wrap: wrap; }
   .dep { display: flex; align-items: center; gap: 4px; font-size: 12px; background: #0f3460; padding: 2px 8px; border-radius: 10px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
@@ -41,6 +42,26 @@
   .action-btn.is-clicked { filter: brightness(1.18); box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.65), 0 0 10px rgba(148, 163, 184, 0.45); }
   .action-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }
   .build-btn { border-color: #4b5563; color: #d1d5db; }
+  .action-btn:disabled,
+  .action-btn.is-disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    color: #6b7280;
+    border-color: #374151;
+    box-shadow: none;
+    filter: none;
+  }
+  .action-btn:disabled:hover,
+  .action-btn.is-disabled:hover {
+    background: #111827;
+    color: #6b7280;
+    border-color: #374151;
+    box-shadow: none;
+  }
+  .action-btn:disabled:active,
+  .action-btn.is-disabled:active {
+    transform: none;
+  }
   .restart-btn { border-color: #1d4ed8; color: #bfdbfe; }
   .logs-btn { border-color: #7c3aed; color: #ddd6fe; }
   .clear-logs-btn { border-color: #b45309; color: #fed7aa; }
@@ -95,6 +116,7 @@
         <div id="logs-panel-meta" class="logs-panel-meta">last 200 lines, auto-refresh every 2s</div>
       </div>
       <div class="logs-panel-actions">
+        <button id="logs-panel-grafana" class="logs-panel-btn" type="button">Grafana</button>
         <button id="logs-panel-copy" class="logs-panel-btn" type="button">Copy</button>
         <button id="logs-panel-refresh" class="logs-panel-btn" type="button">Refresh</button>
         <button id="logs-panel-close" class="logs-panel-btn" type="button">Close</button>
@@ -119,6 +141,7 @@ const logsState = {
   service: '',
   timerId: null,
   requestSerial: 0,
+  lastRows: [],
 };
 const layoutState = {
   resizing: false,
@@ -203,14 +226,23 @@ function renderStatus(data) {
       const commandPort = normalizePortValue(svc.command_port);
       const healthHref = resolveHealthHref(svc.url, healthPort);
       const commandHref = commandPort ? `http://localhost:${commandPort}` : '';
+      const buildable = svc.buildable === true;
+      const language = typeof svc.language === 'string' && svc.language.trim()
+        ? svc.language.trim()
+        : '—';
       html += `<div class="service">`;
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
       html += `<span class="status">${svc.status}</span>`;
+      html += `<span class="language">${esc(language)}</span>`;
       html += `<span class="ports">health/command: ${portLink(healthPort, healthHref)} / ${portLink(commandPort, commandHref)}</span>`;
       html += `<span class="actions">`;
       html += `<button class="action-btn" type="button" data-action="${toggleAction}" data-name="${esc(svc.name)}" data-session-id="${esc(sessionID)}">${toggleLabel}</button>`;
-      html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
+      if (buildable) {
+        html += `<button class="action-btn build-btn" type="button" data-action="build" data-name="${esc(svc.name)}">编译</button>`;
+      } else {
+        html += `<button class="action-btn build-btn is-disabled" type="button" disabled aria-disabled="true" title="未配置 build_command，不可编译">编译</button>`;
+      }
       html += `<button class="action-btn restart-btn" type="button" data-action="restart" data-name="${esc(svc.name)}" data-session-id="${esc(sessionID)}">重启</button>`;
       html += `<button class="action-btn logs-btn" type="button" data-action="logs" data-name="${esc(svc.name)}">日志</button>`;
       html += `<button class="action-btn clear-logs-btn" type="button" data-action="clear-logs" data-name="${esc(svc.name)}">清空日志</button>`;
@@ -444,6 +476,7 @@ function openLogsPanel(name) {
 function closeLogsPanel() {
   logsState.open = false;
   logsState.service = '';
+  logsState.lastRows = [];
   logsState.requestSerial += 1;
   stopLogsAutoRefresh();
   const workspace = document.getElementById('workspace');
@@ -488,10 +521,74 @@ async function fetchLogsOnce() {
 function renderLogs(payload) {
   const name = payload && payload.name ? String(payload.name) : logsState.service;
   const rows = normalizeLogRows(payload && payload.lines ? payload.lines : []);
+  logsState.lastRows = rows;
   const content = document.getElementById('logs-content');
   content.textContent = rows.length > 0 ? rows.join('\n') : 'No logs available.';
   updateLogsMeta(`${rows.length} lines - refreshed at ${formatNowTime()}`);
   document.getElementById('logs-panel-title').textContent = `${name} logs`;
+}
+
+function extractTraceIdFromText(text) {
+  const raw = String(text || '');
+  const jsonMatch = raw.match(/"trace_id"\s*:\s*"([^"]+)"/);
+  if (jsonMatch && jsonMatch[1]) {
+    return jsonMatch[1];
+  }
+  const bracketMatch = raw.match(/\[trace_id=([^\]]+)\]/);
+  if (bracketMatch && bracketMatch[1]) {
+    return bracketMatch[1];
+  }
+  return '';
+}
+
+function extractTraceIdFromLogRows(rows) {
+  if (!Array.isArray(rows)) {
+    return '';
+  }
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const tid = extractTraceIdFromText(rows[i]);
+    if (tid) {
+      return tid;
+    }
+  }
+  return '';
+}
+
+async function openGrafanaTraceLogs() {
+  if (!logsState.service) {
+    alert('Select a service first.');
+    return;
+  }
+  const params = new URLSearchParams({ service: logsState.service });
+  const fromRows = extractTraceIdFromLogRows(logsState.lastRows);
+  if (fromRows) {
+    params.set('trace_id', fromRows);
+  }
+  try {
+    const resp = await fetch(`/api/observability/grafana-trace?${params.toString()}`);
+    const result = await parseJsonSafe(resp);
+    if (!resp.ok) {
+      const manual = window.prompt('未从日志中识别 trace_id，请手动输入：', fromRows || '');
+      if (!manual) {
+        return;
+      }
+      const retry = await fetch(`/api/observability/grafana-trace?${new URLSearchParams({ trace_id: manual.trim() }).toString()}`);
+      const retryResult = await parseJsonSafe(retry);
+      if (!retry.ok || !retryResult.url) {
+        alert(`打开 Grafana 失败: ${retryResult.error || retry.status}`);
+        return;
+      }
+      window.open(retryResult.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    if (!result.url) {
+      alert('Grafana 链接为空');
+      return;
+    }
+    window.open(result.url, '_blank', 'noopener,noreferrer');
+  } catch (err) {
+    alert(`打开 Grafana 失败: ${err.message}`);
+  }
 }
 
 function normalizeLogRows(lines) {
@@ -708,6 +805,10 @@ document.getElementById('services').addEventListener('click', (event) => {
   }
 });
 
+document.getElementById('logs-panel-grafana').addEventListener('click', (event) => {
+  pulseClickFeedback(event.currentTarget);
+  openGrafanaTraceLogs();
+});
 document.getElementById('logs-panel-close').addEventListener('click', (event) => {
   pulseClickFeedback(event.currentTarget);
   closeLogsPanel();

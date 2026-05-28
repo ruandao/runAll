@@ -170,6 +170,9 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 
 	logRepo := domain.ServiceLogRepository(infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity))
 	if fileRoot := strings.TrimSpace(cfg.Logging.FileRoot); fileRoot != "" {
+		if err := os.Setenv("RUNALL_LOG_ROOT", fileRoot); err != nil {
+			log.Printf("[runAll] warning: set RUNALL_LOG_ROOT: %v", err)
+		}
 		fileSink, err := infrastructure.NewFileServiceLogSink(fileRoot)
 		if err != nil {
 			return nil, fmt.Errorf("file log sink: %w", err)

@@ -13,13 +13,19 @@ import (
 )
 
 type Config struct {
-	Version string  `yaml:"version"`
-	Logging Logging `yaml:"logging"`
-	Groups  []Group `yaml:"groups"`
+	Version       string        `yaml:"version"`
+	Logging       Logging       `yaml:"logging"`
+	Observability Observability `yaml:"observability"`
+	Groups        []Group       `yaml:"groups"`
 }
 
 type Logging struct {
 	FileRoot string `yaml:"file_root"`
+}
+
+type Observability struct {
+	GrafanaURL        string `yaml:"grafana_url"`
+	TraceDashboardUID string `yaml:"trace_dashboard_uid"`
 }
 
 type Group struct {
@@ -121,6 +127,7 @@ func fileSHA256(path string) (string, error) {
 
 func (c *Config) fillDefaults() {
 	c.Logging.FileRoot = resolveLogFileRoot(c.Logging.FileRoot)
+	c.Observability = resolveObservability(c.Observability)
 	for gi := range c.Groups {
 		for si := range c.Groups[gi].Services {
 			svc := &c.Groups[gi].Services[si]
@@ -211,4 +218,17 @@ func resolveLogFileRoot(configured string) string {
 		return env
 	}
 	return strings.TrimSpace(configured)
+}
+
+func resolveObservability(o Observability) Observability {
+	if env := strings.TrimSpace(os.Getenv("GRAFANA_URL")); env != "" {
+		o.GrafanaURL = env
+	}
+	if strings.TrimSpace(o.GrafanaURL) == "" {
+		o.GrafanaURL = "http://127.0.0.1:3000"
+	}
+	if strings.TrimSpace(o.TraceDashboardUID) == "" {
+		o.TraceDashboardUID = "trace-log-journey"
+	}
+	return o
 }

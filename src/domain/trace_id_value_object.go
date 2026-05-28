@@ -19,7 +19,7 @@ func ParseTraceId(raw string) (TraceId, error) {
 		return TraceId{}, fmt.Errorf("trace id is required")
 	}
 	if len(s) > 256 {
-		s = s[:256]
+		return TraceId{}, fmt.Errorf("trace id exceeds max length 256")
 	}
 	if !traceIDPattern.MatchString(s) {
 		return TraceId{}, fmt.Errorf("trace id has invalid format")

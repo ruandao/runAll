@@ -116,6 +116,70 @@ func TestAPIStatus_IncludesPortFields(t *testing.T) {
 	}
 }
 
+func TestAPIStatus_IncludesBuildableAndLanguage(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:         "svc-buildable",
+					Command:      "npm run dev",
+					BuildCommand: "npm run build",
+					HealthCheck:  HealthCheck{URL: "http://localhost:4000/health"},
+				},
+				{
+					Name:        "svc-no-build",
+					Command:     "bash run.sh",
+					Language:    "Go",
+					HealthCheck: HealthCheck{URL: "http://localhost:8003/api/health/"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var result []map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("len = %d, want 2", len(result))
+	}
+
+	byName := map[string]map[string]any{}
+	for _, row := range result {
+		name, _ := row["name"].(string)
+		byName[name] = row
+	}
+
+	if byName["svc-buildable"]["buildable"] != true {
+		t.Fatalf("svc-buildable buildable = %#v, want true", byName["svc-buildable"]["buildable"])
+	}
+	if byName["svc-buildable"]["language"] != "JavaScript" {
+		t.Fatalf("svc-buildable language = %#v, want JavaScript", byName["svc-buildable"]["language"])
+	}
+	if byName["svc-no-build"]["buildable"] != false {
+		t.Fatalf("svc-no-build buildable = %#v, want false", byName["svc-no-build"]["buildable"])
+	}
+	if byName["svc-no-build"]["language"] != "Go" {
+		t.Fatalf("svc-no-build language = %#v, want Go", byName["svc-no-build"]["language"])
+	}
+}
+
 func TestUIIncludesFailureFields(t *testing.T) {
 	store := NewStatusStore()
 	runner, err := NewRunner(&Config{
@@ -326,8 +390,12 @@ func TestUIHomePage(t *testing.T) {
 		`data-action="restart"`,
 		`data-action="logs"`,
 		`data-action="clear-logs"`,
+		`id="logs-panel-grafana"`,
 		`id="logs-panel-refresh"`,
 		`id="logs-panel-copy"`,
+		`function openGrafanaTraceLogs()`,
+		`function extractTraceIdFromLogRows(rows)`,
+		`/api/observability/grafana-trace`,
 		`async function copyLogsToClipboard()`,
 		`navigator.clipboard.writeText`,
 		`id="pane-divider"`,
@@ -347,6 +415,10 @@ func TestUIHomePage(t *testing.T) {
 		`target="_blank"`,
 		`rel="noopener noreferrer"`,
 		`health/command:`,
+		`class="language"`,
+		`svc.buildable === true`,
+		`is-disabled`,
+		`未配置 build_command，不可编译`,
 	}
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(body, snippet) {
@@ -568,6 +640,64 @@ func TestAPILogs_Success(t *testing.T) {
 	}
 	if response.Lines[0].Message != "line-2" || response.Lines[1].Message != "line-3" {
 		t.Fatalf("unexpected log lines: %#v", response.Lines)
+	}
+}
+
+func TestAPIObservabilityGrafanaTrace_FromServiceLogs(t *testing.T) {
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Observability: Observability{
+			GrafanaURL:        "http://127.0.0.1:3000",
+			TraceDashboardUID: "trace-log-journey",
+		},
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "saas-backend",
+					Command:     "echo running",
+					HealthCheck: HealthCheck{URL: "http://localhost:9995"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	entry, err := domain.NewLogEntry(
+		time.Now(),
+		"saas-backend",
+		domain.StreamStdout,
+		`{"trace_id":"trace-api-test1234","msg":"relay accepted"}`,
+	)
+	if err != nil {
+		t.Fatalf("NewLogEntry: %v", err)
+	}
+	runner.logRepository.Append("saas-backend", entry)
+
+	mux := http.NewServeMux()
+	registerUIHandlers(mux, store, runner)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/observability/grafana-trace?service=saas-backend", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		TraceID string `json:"trace_id"`
+		URL     string `json:"url"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if response.TraceID != "trace-api-test1234" {
+		t.Fatalf("trace_id = %q", response.TraceID)
+	}
+	if !strings.Contains(response.URL, "var-trace_id=trace-api-test1234") {
+		t.Fatalf("url = %q", response.URL)
 	}
 }
 
