@@ -3345,3 +3345,125 @@ func TestRunner_StartGroup_StartsStoppedServicesInOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteLevel_ResilientMode_PreservesHealthyPeer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{{
+			Name: "platform",
+			Services: []Service{
+				{
+					Name:    "peer-healthy",
+					Command: "sleep 30",
+					HealthCheck: HealthCheck{
+						URL:     srv.URL,
+						Timeout: 5,
+						Retries: 3,
+						Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+					},
+				},
+				{
+					Name:        "peer-broken",
+					Command:     "sleep 30",
+					OnFailure:   "exit",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:65534/unhealthy", Timeout: 1, Retries: 1, Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1}},
+				},
+			},
+		}},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	runner.listenerPIDsFn = func(string) ([]int, error) {
+		return nil, nil
+	}
+
+	level := runner.levels[0]
+	if err := runner.executeLevel(context.Background(), level, true); err != nil {
+		t.Fatalf("executeLevel resilient: %v", err)
+	}
+
+	waitForServiceStatus(t, store, "peer-healthy", StatusHealthy, 10*time.Second)
+	waitForServiceStatus(t, store, "peer-broken", StatusFailed, 10*time.Second)
+
+	runner.mu.Lock()
+	_, okHealthy := runner.processes["peer-healthy"]
+	runner.mu.Unlock()
+	if !okHealthy {
+		t.Fatal("peer-healthy process should still be running after peer-broken failed")
+	}
+
+	runner.stopProcess("peer-healthy")
+	runner.stopProcess("peer-broken")
+}
+
+func TestRun_UIMode_ContinuesWhenPeerFailsWithOnFailureExit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{{
+			Name: "platform",
+			Services: []Service{
+				{
+					Name:    "peer-healthy",
+					Command: "sleep 120",
+					HealthCheck: HealthCheck{
+						URL:     srv.URL,
+						Timeout: 5,
+						Retries: 3,
+						Backoff: Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+					},
+				},
+				{
+					Name:        "peer-broken",
+					Command:     "sleep 120",
+					OnFailure:   "exit",
+					HealthCheck: HealthCheck{URL: "http://127.0.0.1:65534/unhealthy", Timeout: 1, Retries: 1, Backoff: Backoff{Initial: 0.1, Max: 0.1, Multiplier: 1}},
+				},
+			},
+		}},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	runner.listenerPIDsFn = func(string) ([]int, error) {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(ctx, false)
+	}()
+
+	waitForServiceStatus(t, store, "peer-healthy", StatusHealthy, 10*time.Second)
+	waitForServiceStatus(t, store, "peer-broken", StatusFailed, 10*time.Second)
+
+	runner.mu.Lock()
+	_, okHealthy := runner.processes["peer-healthy"]
+	runner.mu.Unlock()
+	if !okHealthy {
+		t.Fatal("peer-healthy process should still be running after peer-broken failed")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error in UI mode: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not exit after cancel")
+	}
+}
