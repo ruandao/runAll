@@ -7,4 +7,4 @@ echo "==> Building runAll..."
 ./build.sh
 
 echo "==> Starting runAll..."
-exec ./bin/runAll --config ../config.yaml "$@"
+exec ./bin/runAll --config ../runAll.yaml "$@"

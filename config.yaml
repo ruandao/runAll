@@ -26,6 +26,14 @@ groups:
 
   - name: platform
     services:
+      - name: task-auth
+        command: "bash run.sh"
+        working_dir: ../taskAuth
+        health_check:
+          url: "http://127.0.0.1:8003/api/health/"
+          timeout: 60
+          retries: 15
+
       - name: git-oauth
         command: "./run.sh"
         working_dir: ../gitOauth
@@ -38,9 +46,9 @@ groups:
         command: >-
           bash -c 'source ./activate_env.sh run &&
           cd Saas_project &&
-          python3 -u manage.py runserver 0.0.0.0:8001'
+          TASKAUTH_ENABLED=true python3 -u manage.py runserver 0.0.0.0:8001'
         working_dir: ../task2app
-        depends_on: [git-oauth]
+        depends_on: [task-auth, git-oauth]
         health_check:
           url: "http://127.0.0.1:8001/api/health/"
           timeout: 120
