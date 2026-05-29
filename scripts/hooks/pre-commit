@@ -1,0 +1,141 @@
+#!/bin/bash
+# Go 仓库 pre-commit 模板（源自 task2app/scripts/hooks/pre-commit 策略）：
+# 1) 优先运行与暂存 .go 文件同包的测试
+# 2) 对其余含测例的包按比例随机抽测
+# 3) 任一测试失败则阻止提交
+
+set -u
+
+cleanup() {
+    echo "如果有测例失败，记得修复"
+    echo "如果提交失败，记得先尝试修复，不行再忽略测例"
+}
+trap cleanup SIGINT SIGTERM EXIT
+
+cd "$(dirname "$0")/../.." || exit 1
+
+echo "Running pre-commit Go tests in $(pwd)..."
+
+TEST_RATIO=30
+STAGED_FILES="$(git diff --cached --name-only 2>/dev/null || true)"
+
+collect_test_dirs() {
+    find . -type f -name '*_test.go' \
+        -not -path './.git/*' \
+        -not -path './node_modules/*' \
+        | while IFS= read -r f; do
+            d="$(dirname "$f")"
+            d="${d#./}"
+            if [ "$d" = "." ]; then
+                echo "."
+            else
+                echo "./${d}"
+            fi
+        done \
+        | sort -u
+}
+
+dir_for_go_file() {
+    local f="$1"
+    case "$f" in
+        *.go) ;;
+        *) return 1 ;;
+    esac
+    local d
+    d="$(dirname "$f")"
+    d="${d#./}"
+    if [ "$d" = "." ]; then
+        echo "."
+    else
+        echo "./${d}"
+    fi
+}
+
+dir_has_tests() {
+    local dir="$1"
+    if [ "$dir" = "." ]; then
+        find . -maxdepth 1 -type f -name '*_test.go' | grep -q .
+    else
+        find "${dir#./}" -type f -name '*_test.go' 2>/dev/null | grep -q .
+    fi
+}
+
+run_go_test_dir() {
+    local dir="$1"
+    if [ "$dir" = "." ]; then
+        echo "Running: go test -count=1 ."
+        go test -count=1 .
+    else
+        echo "Running: go test -count=1 ${dir}/..."
+        go test -count=1 "${dir}/..."
+    fi
+}
+
+TMP_ALL="$(mktemp)"
+TMP_STAGED="$(mktemp)"
+TMP_TO_RUN="$(mktemp)"
+trap 'rm -f "$TMP_ALL" "$TMP_STAGED" "$TMP_TO_RUN"' EXIT
+
+collect_test_dirs > "$TMP_ALL"
+
+if [ ! -s "$TMP_ALL" ]; then
+    echo "No Go test packages found. Commit can proceed."
+    exit 0
+fi
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    dir="$(dir_for_go_file "$f" 2>/dev/null)" || continue
+    if dir_has_tests "$dir"; then
+        echo "$dir" >> "$TMP_STAGED"
+    fi
+done <<< "$STAGED_FILES"
+
+if [ -s "$TMP_STAGED" ]; then
+    sort -u "$TMP_STAGED" -o "$TMP_STAGED"
+    echo "Running staged Go test packages..."
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        run_go_test_dir "$dir" || exit 1
+    done < "$TMP_STAGED"
+else
+    echo "No staged Go files mapped to test packages."
+fi
+
+echo "Running random Go test packages (ratio=${TEST_RATIO}%)..."
+while IFS= read -r dir; do
+    [ -z "$dir" ] && continue
+    if [ -s "$TMP_STAGED" ] && grep -qxF "$dir" "$TMP_STAGED" 2>/dev/null; then
+        continue
+    fi
+    random_num=$((RANDOM % 100))
+    if [ "$random_num" -lt "$TEST_RATIO" ]; then
+        echo "$dir" >> "$TMP_TO_RUN"
+    fi
+done < "$TMP_ALL"
+
+if [ ! -s "$TMP_TO_RUN" ]; then
+    TMP_NON_STAGED="$(mktemp)"
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        if [ -s "$TMP_STAGED" ] && grep -qxF "$dir" "$TMP_STAGED" 2>/dev/null; then
+            continue
+        fi
+        echo "$dir" >> "$TMP_NON_STAGED"
+    done < "$TMP_ALL"
+    if [ -s "$TMP_NON_STAGED" ]; then
+        line_count=$(wc -l < "$TMP_NON_STAGED" | tr -d ' ')
+        random_line=$((RANDOM % line_count + 1))
+        FALLBACK_DIR=$(sed -n "${random_line}p" "$TMP_NON_STAGED")
+        echo "$FALLBACK_DIR" >> "$TMP_TO_RUN"
+        echo "(No package selected by random; running one at random: $FALLBACK_DIR)"
+    fi
+    rm -f "$TMP_NON_STAGED"
+fi
+
+while IFS= read -r dir; do
+    [ -z "$dir" ] && continue
+    run_go_test_dir "$dir" || exit 1
+done < "$TMP_TO_RUN"
+
+echo "All Go tests passed. Commit can proceed."
