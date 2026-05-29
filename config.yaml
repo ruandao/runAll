@@ -10,7 +10,7 @@ logging:
 observability:
   grafana_url: "http://127.0.0.1:3000"
   loki_url: "http://127.0.0.1:3100"
-  trace_dashboard_uid: trace-log-journey
+  trace_dashboard_uid: distributed-trace-view
 
 groups:
   - name: infrastructure
@@ -22,8 +22,8 @@ groups:
         working_dir: ../task2app/Saas_project
         health_check:
           url: "http://127.0.0.1:18080"
-          timeout: 120
-          retries: 30
+          timeout: 180
+          retries: 40
           backoff:
             initial: 2.0
             max: 16.0
@@ -52,17 +52,21 @@ groups:
         command: >-
           bash -c 'source ./activate_env.sh run &&
           cd Saas_project &&
-          TASKAUTH_ENABLED=true python3 -u manage.py runserver 0.0.0.0:8001'
+          TASKAUTH_ENABLED=true python3 -u manage.py runserver 0.0.0.0:8001 --noreload'
         working_dir: ../task2app
+        env:
+          DISABLE_MANAGEPY_VUE_AUTOSTART: "1"
         depends_on: [task-auth, git-oauth, docker-infra, task-sse]
         health_check:
+          liveness_url: "http://127.0.0.1:8001/api/live/"
           url: "http://127.0.0.1:8001/api/health/"
-          timeout: 120
-          retries: 30
+          timeout: 180
+          retries: 35
           backoff:
             initial: 2.0
             max: 16.0
             multiplier: 2.0
+        on_failure: skip
 
       - name: task-sse
         command: "bash run.sh"

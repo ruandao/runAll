@@ -32,6 +32,9 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 			writeJSONErrorWithStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if runner != nil {
+			runner.reconcileFailedServiceHealth(r.Context())
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(buildStatusPayload(store, runner)); err != nil {
 			log.Printf("[ui] json encode error: %v", err)
@@ -171,10 +174,16 @@ func registerUIHandlers(mux *http.ServeMux, store *StatusStore, runner *Runner) 
 			writeJSONError(w, err.Error())
 			return
 		}
+		tempoExplore, err := domain.GrafanaTempoExploreLink(obs.GrafanaURL, "")
+		if err != nil {
+			writeJSONError(w, err.Error())
+			return
+		}
 		payload := map[string]string{
 			"grafana_url":           obs.GrafanaURL,
 			"loki_url":              obs.LokiURL,
 			"grafana_loki_explore":  lokiExplore,
+			"grafana_tempo_explore": tempoExplore,
 			"trace_dashboard_uid":   obs.TraceDashboardUID,
 			"log_file_root":         strings.TrimSpace(runner.cfg.Logging.FileRoot),
 		}

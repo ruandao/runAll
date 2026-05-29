@@ -319,3 +319,27 @@ func TestDoctor_ReturnsNonZeroWhenPreflightFails(t *testing.T) {
 		t.Fatalf("report missing failure code, report=%s", out.String())
 	}
 }
+
+func TestStatusStore_SetReadinessUpdatesDependencyDisplay(t *testing.T) {
+	store := NewStatusStore()
+	store.Init([]string{"saas-backend", "vue-frontend"})
+	store.SetDependsOn("vue-frontend", []DepStatus{{Name: "saas-backend", Status: StatusPending}})
+
+	store.Update("saas-backend", StatusHealthy, "")
+	store.SetReadiness("saas-backend", ReadinessDegraded, "kafka unreachable")
+
+	backend := store.Get("saas-backend")
+	if backend.Readiness != ReadinessDegraded {
+		t.Fatalf("readiness = %q, want degraded", backend.Readiness)
+	}
+	frontend := store.Get("vue-frontend")
+	if frontend.DependsOn[0].Status != StatusRetrying {
+		t.Fatalf("dependency status = %q, want retrying", frontend.DependsOn[0].Status)
+	}
+
+	store.SetReadiness("saas-backend", ReadinessReady, "")
+	frontend = store.Get("vue-frontend")
+	if frontend.DependsOn[0].Status != StatusHealthy {
+		t.Fatalf("dependency status = %q, want healthy", frontend.DependsOn[0].Status)
+	}
+}

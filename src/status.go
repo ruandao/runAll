@@ -22,11 +22,23 @@ const (
 	StatusStopped    Status = "stopped"
 )
 
+// ReadinessStatus tracks readiness probe state separately from liveness (Status).
+type ReadinessStatus string
+
+const (
+	ReadinessUnknown  ReadinessStatus = ""
+	ReadinessPending  ReadinessStatus = "pending"
+	ReadinessReady    ReadinessStatus = "ready"
+	ReadinessDegraded ReadinessStatus = "degraded"
+)
+
 type ServiceStatus struct {
-	Name         string      `json:"name"`
-	Group        string      `json:"group"`
-	Status       Status      `json:"status"`
-	Phase        string      `json:"phase,omitempty"`
+	Name            string          `json:"name"`
+	Group           string          `json:"group"`
+	Status          Status          `json:"status"`
+	Readiness       ReadinessStatus `json:"readiness,omitempty"`
+	ReadinessError  string          `json:"readiness_error,omitempty"`
+	Phase           string          `json:"phase,omitempty"`
 	FailurePhase string      `json:"failure_phase,omitempty"`
 	FailureCode  string      `json:"failure_code,omitempty"`
 	DependsOn    []DepStatus `json:"depends_on"`
@@ -88,6 +100,52 @@ func (s *StatusStore) Update(name string, status Status, errMsg string) {
 	} else if status == StatusHealthy {
 		svc.Error = ""
 	}
+	s.syncDependencyReadinessLocked(name)
+}
+
+func (s *StatusStore) SetReadiness(name string, readiness ReadinessStatus, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	svc, ok := s.services[name]
+	if !ok {
+		return
+	}
+	svc.Readiness = readiness
+	if errMsg != "" {
+		svc.ReadinessError = errMsg
+	} else if readiness == ReadinessReady {
+		svc.ReadinessError = ""
+	}
+	s.syncDependencyReadinessLocked(name)
+}
+
+func (s *StatusStore) syncDependencyReadinessLocked(depName string) {
+	dep := s.services[depName]
+	if dep == nil {
+		return
+	}
+	depStatus := dependencyDisplayStatus(dep)
+	for _, svc := range s.services {
+		for i, d := range svc.DependsOn {
+			if d.Name != depName {
+				continue
+			}
+			svc.DependsOn[i].Status = depStatus
+		}
+	}
+}
+
+func dependencyDisplayStatus(dep *ServiceStatus) Status {
+	if dep == nil {
+		return StatusPending
+	}
+	if dep.Status == StatusFailed || dep.Status == StatusSkipped || dep.Status == StatusStopped {
+		return dep.Status
+	}
+	if dep.Status == StatusHealthy && dep.Readiness != "" && dep.Readiness != ReadinessReady {
+		return StatusRetrying
+	}
+	return dep.Status
 }
 
 func (s *StatusStore) RecordPreflightFailure(name, failureCode, errMsg string) {
@@ -106,6 +164,7 @@ func (s *StatusStore) RecordFailure(name, failurePhase, failureCode, errMsg stri
 	svc.FailurePhase = failurePhase
 	svc.FailureCode = failureCode
 	svc.Error = errMsg
+	s.syncDependencyReadinessLocked(name)
 }
 
 func phaseForStatus(status Status) string {
@@ -204,16 +263,10 @@ func (s *StatusStore) CompareAndSwapStatus(name string, old, new Status) bool {
 	return true
 }
 
-func (s *StatusStore) UpdateDependencyStatus(name string, status Status) {
+func (s *StatusStore) UpdateDependencyStatus(name string, _ Status) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, svc := range s.services {
-		for i, dep := range svc.DependsOn {
-			if dep.Name == name {
-				svc.DependsOn[i].Status = status
-			}
-		}
-	}
+	s.syncDependencyReadinessLocked(name)
 }
 
 func (s *StatusStore) Get(name string) *ServiceStatus {

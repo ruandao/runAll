@@ -2510,8 +2510,17 @@ func TestMonitor_StopsOnCancel(t *testing.T) {
 	}
 }
 
-func TestMonitor_CleansUpAfterUnhealthy(t *testing.T) {
+func TestMonitor_RecoversAfterBecomingHealthy(t *testing.T) {
+	healthy := false
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ok := healthy
+		mu.Unlock()
+		if ok {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
@@ -2548,15 +2557,61 @@ func TestMonitor_CleansUpAfterUnhealthy(t *testing.T) {
 	svc := cfg.Groups[0].Services[0]
 	runner.startMonitoring(ctx, svc)
 
-	// Wait for monitor to detect unhealthy and exit
 	waitForStatus(t, store, "test-svc", StatusFailed, 5*time.Second)
 
-	// Monitor entry should be cleaned up after goroutine exits
+	mu.Lock()
+	healthy = true
+	mu.Unlock()
+
+	waitForStatus(t, store, "test-svc", StatusHealthy, 5*time.Second)
+
 	runner.monitorMu.Lock()
 	_, exists := runner.monitors["test-svc"]
 	runner.monitorMu.Unlock()
-	if exists {
-		t.Error("monitor entry should be removed after goroutine exits via unhealthy threshold")
+	if !exists {
+		t.Error("monitor should keep running after recovery")
+	}
+}
+
+func TestReconcileFailedServiceHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	store := NewStatusStore()
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:    "test-svc",
+					Command: "echo hi",
+					HealthCheck: HealthCheck{
+						URL:                srv.URL,
+						Timeout:            30,
+						Retries:            10,
+						CheckInterval:      1,
+						UnhealthyThreshold: 2,
+					},
+				},
+			}},
+		},
+	}
+
+	runner, err := NewRunner(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("test-svc", StatusFailed, "connection refused")
+
+	runner.reconcileFailedServiceHealth(context.Background())
+
+	if got := store.Get("test-svc").Status; got != StatusHealthy {
+		t.Fatalf("status = %q, want healthy after reconcile", got)
+	}
+	if store.Get("test-svc").Error != "" {
+		t.Fatalf("error = %q, want cleared", store.Get("test-svc").Error)
 	}
 }
 
@@ -3466,4 +3521,119 @@ func TestRun_UIMode_ContinuesWhenPeerFailsWithOnFailureExit(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not exit after cancel")
 	}
+}
+
+func TestStreamOutput_SkipsBlankLines(t *testing.T) {
+	repo := infrastructure.NewInMemoryServiceLogRepository(100)
+	input := strings.NewReader("line-one\n\n  \nline-two\n")
+	streamOutput(input, "svc", domain.StreamStdout, repo)
+
+	entries := repo.Tail("svc", 10)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 log entries, got %d", len(entries))
+	}
+	if entries[0].Message != "line-one" || entries[1].Message != "line-two" {
+		t.Fatalf("unexpected messages: %#v", entries)
+	}
+}
+
+func TestStartAndCheck_UsesLivenessURLForStartup(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/live/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/api/health/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store := NewStatusStore()
+	store.Init([]string{"liveness-svc"})
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{{
+			Name: "g1",
+			Services: []Service{{
+				Name:    "liveness-svc",
+				Command: "sleep 30",
+				HealthCheck: HealthCheck{
+					LivenessURL: srv.URL + "/api/live/",
+					URL:         srv.URL + "/api/health/",
+					Timeout:     5,
+					Retries:     3,
+					Backoff:     Backoff{Initial: 0.1, Max: 0.2, Multiplier: 1.5},
+				},
+				OnFailure: "skip",
+			}},
+		}},
+	}
+	runner := &Runner{
+		cfg:       cfg,
+		store:     store,
+		processes: make(map[string]*exec.Cmd),
+		monitors:  make(map[string]context.CancelFunc),
+	}
+
+	node := &ServiceNode{Service: cfg.Flatten()[0]}
+	if err := runner.startAndCheck(context.Background(), node); err != nil {
+		t.Fatalf("startAndCheck with liveness probe: %v", err)
+	}
+	status := store.Get("liveness-svc")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", status)
+	}
+	runner.stopProcess("liveness-svc")
+}
+
+func TestRunMonitor_SplitProbeReadinessDegradedPreservesLive(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store := NewStatusStore()
+	cfg := &Config{
+		Version: "1",
+		Groups: []Group{{
+			Name: "g1",
+			Services: []Service{{
+				Name:    "split-svc",
+				Command: "sleep 30",
+				HealthCheck: HealthCheck{
+					LivenessURL:        srv.URL + "/live",
+					URL:                srv.URL + "/ready",
+					CheckInterval:      1,
+					UnhealthyThreshold: 2,
+				},
+			}},
+		}},
+	}
+	runner, err := NewRunner(cfg, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	store.Update("split-svc", StatusHealthy, "")
+	store.SetReadiness("split-svc", ReadinessReady, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner.startMonitoring(ctx, cfg.Groups[0].Services[0])
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st := store.Get("split-svc")
+		if st != nil && st.Status == StatusHealthy && st.Readiness == ReadinessDegraded {
+			cancel()
+			runner.stopProcess("split-svc")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("expected healthy + readiness degraded, got %#v", store.Get("split-svc"))
 }

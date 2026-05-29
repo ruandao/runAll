@@ -149,6 +149,27 @@ const dotClass = {
   healthy: 'green', starting: 'yellow', retrying: 'yellow', restarting: 'yellow',
   pending: 'gray', stopped: 'gray', failed: 'red', skipped: 'dark'
 };
+
+function serviceDotClass(svc) {
+  if (svc && svc.status === 'healthy' && svc.readiness && svc.readiness !== 'ready') {
+    return 'yellow';
+  }
+  return dotClass[svc.status] || 'gray';
+}
+
+function formatServiceStatus(svc) {
+  const live = svc.status || 'unknown';
+  if (!svc.readiness) {
+    return live;
+  }
+  if (svc.readiness === 'ready') {
+    return `${live} · ready`;
+  }
+  if (svc.readiness === 'degraded') {
+    return `${live} · not ready`;
+  }
+  return `${live} · ${svc.readiness}`;
+}
 const logsState = {
   open: false,
   service: '',
@@ -230,7 +251,7 @@ function renderStatus(data) {
       return String(a.name || '').localeCompare(String(b.name || ''));
     });
     for (const svc of sortedServices) {
-      const cls = dotClass[svc.status] || 'gray';
+      const cls = serviceDotClass(svc);
       const startable = isServiceStartable(svc.status);
       const toggleAction = startable ? 'start' : 'stop';
       const toggleLabel = startable ? '启动' : '关闭';
@@ -246,7 +267,7 @@ function renderStatus(data) {
       html += `<div class="service">`;
       html += `<span class="dot ${cls}"></span>`;
       html += `<span class="name">${esc(svc.name)}</span>`;
-      html += `<span class="status">${svc.status}</span>`;
+      html += `<span class="status">${formatServiceStatus(svc)}</span>`;
       html += `<span class="language">${esc(language)}</span>`;
       html += `<span class="ports">health/command: ${portLink(healthPort, healthHref)} / ${portLink(commandPort, commandHref)}</span>`;
       html += `<span class="actions">`;
@@ -270,6 +291,9 @@ function renderStatus(data) {
       }
       if (svc.error) {
         html += `<span class="error-msg">${esc(svc.error)}</span>`;
+      }
+      if (svc.readiness_error) {
+        html += `<span class="error-msg" title="readiness probe">${esc(svc.readiness_error)}</span>`;
       }
       if (svc.last_checked) {
         html += `<span class="last-checked">checked: ${formatTime(svc.last_checked)}</span>`;
@@ -571,6 +595,7 @@ const observabilityState = {
   grafanaUrl: '',
   lokiUrl: '',
   grafanaLokiExplore: '',
+  grafanaTempoExplore: '',
   logFileRoot: '',
 };
 
@@ -589,9 +614,13 @@ async function loadObservabilityBar() {
     observabilityState.grafanaUrl = data.grafana_url || '';
     observabilityState.lokiUrl = data.loki_url || '';
     observabilityState.grafanaLokiExplore = data.grafana_loki_explore || '';
+    observabilityState.grafanaTempoExplore = data.grafana_tempo_explore || '';
     observabilityState.logFileRoot = data.log_file_root || '';
     const parts = [
-      '<span class="obs-label">集中日志:</span>',
+      '<span class="obs-label">可观测:</span>',
+      observabilityState.grafanaTempoExplore
+        ? `<a href="${observabilityState.grafanaTempoExplore}" target="_blank" rel="noopener noreferrer">Tempo Explore</a>`
+        : '',
       observabilityState.grafanaLokiExplore
         ? `<a href="${observabilityState.grafanaLokiExplore}" target="_blank" rel="noopener noreferrer">Loki Explore</a>`
         : '',

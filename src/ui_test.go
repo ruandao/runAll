@@ -695,6 +695,12 @@ func TestAPIObservability_IncludesLoki(t *testing.T) {
 	if !strings.Contains(response["grafana_loki_explore"], "/explore") {
 		t.Fatalf("grafana_loki_explore = %q", response["grafana_loki_explore"])
 	}
+	if !strings.Contains(response["grafana_tempo_explore"], "/explore") {
+		t.Fatalf("grafana_tempo_explore = %q", response["grafana_tempo_explore"])
+	}
+	if !strings.Contains(response["grafana_tempo_explore"], "tempo") {
+		t.Fatalf("grafana_tempo_explore = %q", response["grafana_tempo_explore"])
+	}
 }
 
 func TestAPIObservabilityGrafanaTrace_FromServiceLogs(t *testing.T) {

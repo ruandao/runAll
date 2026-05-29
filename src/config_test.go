@@ -84,6 +84,38 @@ groups:
 	}
 }
 
+func TestHealthCheck_StartupProbeURL(t *testing.T) {
+	hc := HealthCheck{
+		URL:         "http://127.0.0.1:8001/api/health/",
+		LivenessURL: "http://127.0.0.1:8001/api/live/",
+	}
+	if got := hc.StartupProbeURL(); got != hc.LivenessURL {
+		t.Fatalf("StartupProbeURL() = %q, want %q", got, hc.LivenessURL)
+	}
+	if got := hc.ReadinessProbeURL(); got != hc.URL {
+		t.Fatalf("ReadinessProbeURL() = %q, want %q", got, hc.URL)
+	}
+	startup := hc.StartupProbeConfig()
+	if startup.URL != hc.LivenessURL {
+		t.Fatalf("StartupProbeConfig().URL = %q, want %q", startup.URL, hc.LivenessURL)
+	}
+
+	plain := HealthCheck{URL: "http://127.0.0.1:9000/health"}
+	if got := plain.StartupProbeURL(); got != plain.URL {
+		t.Fatalf("StartupProbeURL without liveness = %q, want %q", got, plain.URL)
+	}
+	if plain.HasSplitProbe() {
+		t.Fatal("expected no split probe without liveness_url")
+	}
+	split := HealthCheck{
+		LivenessURL: "http://127.0.0.1:8001/api/live/",
+		URL:         "http://127.0.0.1:8001/api/health/",
+	}
+	if !split.HasSplitProbe() {
+		t.Fatal("expected split probe")
+	}
+}
+
 func TestLoadConfig_LoggingFileRoot(t *testing.T) {
 	yamlContent := `
 version: "1"
@@ -162,7 +194,7 @@ groups:
 	if cfg.Observability.LokiURL != "http://127.0.0.1:3100" {
 		t.Errorf("loki_url = %q", cfg.Observability.LokiURL)
 	}
-	if cfg.Observability.TraceDashboardUID != "trace-log-journey" {
+	if cfg.Observability.TraceDashboardUID != "distributed-trace-view" {
 		t.Errorf("trace_dashboard_uid = %q", cfg.Observability.TraceDashboardUID)
 	}
 }

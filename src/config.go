@@ -48,11 +48,41 @@ type Service struct {
 
 type HealthCheck struct {
 	URL                string  `yaml:"url"`
+	LivenessURL        string  `yaml:"liveness_url"` // optional; startup probe only (readiness uses url)
 	Timeout            int     `yaml:"timeout"`
 	Retries            int     `yaml:"retries"`
 	CheckInterval      int     `yaml:"check_interval"`      // seconds between continuous health pings
 	UnhealthyThreshold int     `yaml:"unhealthy_threshold"` // consecutive failures before marking unhealthy
 	Backoff            Backoff `yaml:"backoff"`
+}
+
+// StartupProbeURL returns the HTTP URL used while waiting for a service to become ready.
+// When liveness_url is set, startup waits only for the process to serve HTTP (fast path).
+// Continuous monitoring and dependency semantics still use url (readiness).
+func (hc HealthCheck) StartupProbeURL() string {
+	if u := strings.TrimSpace(hc.LivenessURL); u != "" {
+		return u
+	}
+	return hc.URL
+}
+
+// ReadinessProbeURL returns the URL for ongoing readiness monitoring.
+func (hc HealthCheck) ReadinessProbeURL() string {
+	return hc.URL
+}
+
+// HasSplitProbe reports whether startup (liveness) and monitoring (readiness) use different URLs.
+func (hc HealthCheck) HasSplitProbe() bool {
+	live := strings.TrimSpace(hc.LivenessURL)
+	ready := strings.TrimSpace(hc.ReadinessProbeURL())
+	return live != "" && ready != "" && live != ready
+}
+
+// StartupProbeConfig returns a HealthCheck copy that probes liveness during startup.
+func (hc HealthCheck) StartupProbeConfig() HealthCheck {
+	probe := hc
+	probe.URL = hc.StartupProbeURL()
+	return probe
 }
 
 type Backoff struct {
@@ -235,7 +265,7 @@ func resolveObservability(o Observability) Observability {
 		o.LokiURL = "http://127.0.0.1:3100"
 	}
 	if strings.TrimSpace(o.TraceDashboardUID) == "" {
-		o.TraceDashboardUID = "trace-log-journey"
+		o.TraceDashboardUID = "distributed-trace-view"
 	}
 	return o
 }

@@ -221,8 +221,9 @@ func actorSessionIDFromContext(ctx context.Context) string {
 }
 
 func (r *Runner) Run(ctx context.Context, daemon bool) error {
+	resilient := !daemon
 	for _, level := range r.levels {
-		if err := r.executeLevel(ctx, level); err != nil {
+		if err := r.executeLevel(ctx, level, resilient); err != nil {
 			return err
 		}
 	}
@@ -251,7 +252,7 @@ func (r *Runner) Run(ctx context.Context, daemon bool) error {
 	return nil
 }
 
-func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
+func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel, resilient bool) error {
 	levelCtx, levelCancel := context.WithCancel(ctx)
 	defer levelCancel()
 
@@ -259,6 +260,13 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 	errCh := make(chan error, len(level.Services))
 	exitFailed := make(chan struct{})
 	var exitOnce sync.Once
+
+	abortPeers := func() {
+		if resilient {
+			return
+		}
+		exitOnce.Do(func() { close(exitFailed); levelCancel() })
+	}
 
 	for _, node := range level.Services {
 		// Check if any dependency was skipped/failed
@@ -279,10 +287,12 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 		wg.Add(1)
 		go func(node *ServiceNode) {
 			defer wg.Done()
-			select {
-			case <-exitFailed:
-				return
-			default:
+			if !resilient {
+				select {
+				case <-exitFailed:
+					return
+				default:
+				}
 			}
 			if err := r.runPreflight(levelCtx, node.Service); err != nil {
 				current := r.store.Get(node.Service.Name)
@@ -290,13 +300,22 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 					r.store.Update(node.Service.Name, StatusFailed, fmt.Sprintf("preflight failed: %v", err))
 				}
 				r.store.UpdateDependencyStatus(node.Service.Name, StatusFailed)
-				errCh <- err
-				exitOnce.Do(func() { close(exitFailed); levelCancel() })
+				if !resilient && node.Service.OnFailure == "exit" {
+					errCh <- err
+					abortPeers()
+				}
+				return
+			}
+			if err := r.waitForDependencyReadiness(levelCtx, node.Service); err != nil {
+				r.store.Update(node.Service.Name, StatusSkipped, err.Error())
+				log.Printf("[%s] SKIPPED: %v", node.Service.Name, err)
 				return
 			}
 			if err := r.startAndCheck(levelCtx, node); err != nil {
-				errCh <- err
-				exitOnce.Do(func() { close(exitFailed); levelCancel() })
+				if !resilient && node.Service.OnFailure == "exit" {
+					errCh <- err
+					abortPeers()
+				}
 			}
 		}(node)
 	}
@@ -312,7 +331,7 @@ func (r *Runner) executeLevel(ctx context.Context, level ExecutionLevel) error {
 		}
 	}
 
-	// If any exit-type failure occurred, stop everything
+	// Strict mode: any exit-type failure stops everything.
 	if firstErr != nil {
 		r.Shutdown()
 		return firstErr
@@ -427,7 +446,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 
 	// Health check
 	r.store.Update(svc.Name, StatusRetrying, "")
-	err = waitHealthyWithLaunchCheck(ctx, cmd.Process, svc.HealthCheck)
+	err = waitHealthyWithLaunchCheck(ctx, cmd.Process, svc.HealthCheck.StartupProbeConfig(), isDetachLaunchCommand(svc.Command))
 	if err != nil {
 		phase, code := classifyStartupFailure(err)
 		if phase == "" || code == "" {
@@ -444,9 +463,42 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	}
 
 	r.store.Update(svc.Name, StatusHealthy, "")
+	r.probeReadiness(ctx, svc)
 	r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
 	r.establishServiceOwnership(svc, cmd.Process.Pid, actorSessionIDFromContext(ctx))
-	log.Printf("[%s] healthy (%s)", svc.Name, svc.HealthCheck.URL)
+	log.Printf("[%s] healthy (%s)", svc.Name, svc.HealthCheck.StartupProbeURL())
+	return nil
+}
+
+func (r *Runner) probeReadiness(ctx context.Context, svc Service) {
+	if !svc.HealthCheck.HasSplitProbe() {
+		r.store.SetReadiness(svc.Name, ReadinessReady, "")
+		return
+	}
+	if err := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL()); err != nil {
+		r.store.SetReadiness(svc.Name, ReadinessDegraded, err.Error())
+		return
+	}
+	r.store.SetReadiness(svc.Name, ReadinessReady, "")
+}
+
+func (r *Runner) waitForDependencyReadiness(ctx context.Context, svc Service) error {
+	for _, depName := range svc.DependsOn {
+		dep := r.findService(depName)
+		if dep == nil || !dep.HealthCheck.HasSplitProbe() {
+			continue
+		}
+		st := r.store.Get(depName)
+		if st == nil || st.Status == StatusSkipped || st.Status == StatusFailed {
+			continue
+		}
+		probe := dep.HealthCheck
+		probe.URL = probe.ReadinessProbeURL()
+		if err := waitHealthy(ctx, probe); err != nil {
+			return fmt.Errorf("dependency %q readiness: %w", depName, err)
+		}
+		r.store.SetReadiness(depName, ReadinessReady, "")
+	}
 	return nil
 }
 
@@ -475,7 +527,7 @@ func (r *Runner) establishServiceOwnership(svc Service, pid int, actorSessionID 
 	}
 }
 
-func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg HealthCheck) error {
+func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg HealthCheck, allowLaunchExit bool) error {
 	interval := time.Duration(cfg.Backoff.Initial * float64(time.Second))
 	maxInterval := time.Duration(cfg.Backoff.Max * float64(time.Second))
 	deadline := time.Now().Add(time.Duration(cfg.Timeout) * time.Second)
@@ -488,7 +540,7 @@ func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg He
 		case <-time.After(interval):
 		}
 
-		if processHasExited(process) {
+		if !allowLaunchExit && processHasExited(process) {
 			return fmt.Errorf("launch process exited before readiness")
 		}
 
@@ -504,7 +556,7 @@ func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg He
 			return nil
 		}
 		lastCheckErr = err
-		if processHasExited(process) {
+		if !allowLaunchExit && processHasExited(process) {
 			return fmt.Errorf("launch process exited before readiness")
 		}
 
@@ -981,6 +1033,11 @@ func (r *Runner) startService(ctx context.Context, name string) error {
 		r.store.SetPID(name, 0)
 		return err
 	}
+	if err := r.waitForDependencyReadiness(ctx, *svc); err != nil {
+		r.store.SetPID(name, 0)
+		r.store.Update(name, previousStatus, err.Error())
+		return err
+	}
 
 	node := &ServiceNode{Service: *svc}
 	if err := r.startAndCheck(ctx, node); err != nil {
@@ -1377,6 +1434,9 @@ func streamOutput(reader io.Reader, name, stream string, repository domain.Servi
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
 		if repository != nil {
 			entry, err := domain.NewLogEntry(time.Now(), name, stream, line)
 			if err != nil {
@@ -1429,6 +1489,46 @@ func (r *Runner) removeMonitor(name string) {
 	delete(r.monitors, name)
 }
 
+// reconcileFailedServiceHealth re-probes services marked failed. When the health
+// endpoint is reachable again (e.g. Docker stack restarted manually), status is
+// restored so the UI refresh reflects recovery without a full runAll restart.
+func (r *Runner) reconcileFailedServiceHealth(ctx context.Context) {
+	if r == nil || r.cfg == nil {
+		return
+	}
+	for _, svc := range r.cfg.Flatten() {
+		st := r.store.Get(svc.Name)
+		if st == nil || st.Status != StatusFailed {
+			continue
+		}
+		if strings.TrimSpace(svc.HealthCheck.URL) == "" {
+			continue
+		}
+		now := time.Now()
+		if svc.HealthCheck.HasSplitProbe() {
+			if err := checkHealth(ctx, svc.HealthCheck.StartupProbeURL()); err != nil {
+				r.store.SetLastChecked(svc.Name, now)
+				continue
+			}
+			r.store.Update(svc.Name, StatusHealthy, "")
+			r.probeReadiness(ctx, svc)
+			r.store.SetLastChecked(svc.Name, now)
+			log.Printf("[%s] recovered (liveness ok on status reconcile)", svc.Name)
+			r.startMonitoring(context.Background(), svc)
+			continue
+		}
+		if err := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL()); err != nil {
+			r.store.SetLastChecked(svc.Name, now)
+			continue
+		}
+		r.store.Update(svc.Name, StatusHealthy, "")
+		r.store.SetLastChecked(svc.Name, now)
+		r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
+		log.Printf("[%s] recovered (health check ok on status reconcile)", svc.Name)
+		r.startMonitoring(context.Background(), svc)
+	}
+}
+
 func (r *Runner) runMonitor(ctx context.Context, svc Service, interval time.Duration) {
 	defer r.removeMonitor(svc.Name)
 
@@ -1437,24 +1537,65 @@ func (r *Runner) runMonitor(ctx context.Context, svc Service, interval time.Dura
 
 	consecutive := 0
 	threshold := svc.HealthCheck.UnhealthyThreshold
+	if threshold < 1 {
+		threshold = 1
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			err := checkHealth(ctx, svc.HealthCheck.URL)
-			r.store.SetLastChecked(svc.Name, time.Now())
+			now := time.Now()
+			r.store.SetLastChecked(svc.Name, now)
+
+			if svc.HealthCheck.HasSplitProbe() {
+				liveErr := checkHealth(ctx, svc.HealthCheck.StartupProbeURL())
+				if liveErr != nil {
+					consecutive++
+					log.Printf("[%s] liveness check failed (%d/%d): %v", svc.Name, consecutive, threshold, liveErr)
+					if consecutive >= threshold {
+						if st := r.store.Get(svc.Name); st == nil || st.Status != StatusFailed {
+							r.store.Update(svc.Name, StatusFailed, liveErr.Error())
+							log.Printf("[%s] marked failed after %d consecutive liveness failures", svc.Name, consecutive)
+						}
+						consecutive = threshold
+					}
+					continue
+				}
+				consecutive = 0
+				if st := r.store.Get(svc.Name); st != nil && st.Status == StatusFailed {
+					r.store.Update(svc.Name, StatusHealthy, "")
+					r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
+					log.Printf("[%s] recovered (liveness check ok)", svc.Name)
+				}
+				if readyErr := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL()); readyErr != nil {
+					r.store.SetReadiness(svc.Name, ReadinessDegraded, readyErr.Error())
+					log.Printf("[%s] readiness degraded: %v", svc.Name, readyErr)
+				} else {
+					r.store.SetReadiness(svc.Name, ReadinessReady, "")
+				}
+				continue
+			}
+
+			err := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL())
 			if err != nil {
 				consecutive++
 				log.Printf("[%s] health check failed (%d/%d): %v", svc.Name, consecutive, threshold, err)
 				if consecutive >= threshold {
-					r.store.Update(svc.Name, StatusFailed, err.Error())
-					log.Printf("[%s] marked failed after %d consecutive failures", svc.Name, consecutive)
-					return
+					if st := r.store.Get(svc.Name); st == nil || st.Status != StatusFailed {
+						r.store.Update(svc.Name, StatusFailed, err.Error())
+						log.Printf("[%s] marked failed after %d consecutive failures", svc.Name, consecutive)
+					}
+					consecutive = threshold
 				}
-			} else {
-				consecutive = 0
+				continue
+			}
+			consecutive = 0
+			if st := r.store.Get(svc.Name); st != nil && st.Status == StatusFailed {
+				r.store.Update(svc.Name, StatusHealthy, "")
+				r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
+				log.Printf("[%s] recovered (health check ok)", svc.Name)
 			}
 		}
 	}
