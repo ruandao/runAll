@@ -106,7 +106,8 @@ groups:
   - name: container-stack
     services:
       - name: go-run-container
-        command: "go build -o go_run_container . && ./go_run_container"
+        build_command: "./build.sh"
+        command: "./start.sh managed --skip-build"
         working_dir: ../go_run_container
         health_check:
           url: "http://127.0.0.1:8796/health"
@@ -114,7 +115,8 @@ groups:
           retries: 15
 
       - name: go-relay
-        command: "go build -o go_relayToTrae . && ./go_relayToTrae"
+        build_command: "./build.sh"
+        command: "./bin/go_relayToTrae"
         working_dir: ../go_relayToTrae
         health_check:
           url: "http://127.0.0.1:8797/health"

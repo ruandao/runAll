@@ -29,6 +29,7 @@ type Runner struct {
 	monitors                     map[string]context.CancelFunc
 	monitorMu                    sync.Mutex
 	logRepository                domain.ServiceLogRepository
+	fileLogSink                    domain.ServiceLogFileSink
 	ownershipRepo                domain.ServiceOwnershipRepository
 	ownershipGuard               domain.ServiceOwnershipGuardService
 	runtimePrereqProbeRepository domain.ServiceRuntimePrereqProbeRepository
@@ -169,6 +170,7 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 	ownershipRepo := infrastructure.NewInMemoryServiceOwnershipRepository()
 
 	logRepo := domain.ServiceLogRepository(infrastructure.NewInMemoryServiceLogRepository(infrastructure.DefaultServiceLogCapacity))
+	var fileLogSink domain.ServiceLogFileSink
 	if fileRoot := strings.TrimSpace(cfg.Logging.FileRoot); fileRoot != "" {
 		if err := os.Setenv("RUNALL_LOG_ROOT", fileRoot); err != nil {
 			log.Printf("[runAll] warning: set RUNALL_LOG_ROOT: %v", err)
@@ -177,6 +179,7 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 		if err != nil {
 			return nil, fmt.Errorf("file log sink: %w", err)
 		}
+		fileLogSink = fileSink
 		logRepo = infrastructure.NewTeeServiceLogRepository(logRepo, fileSink)
 		log.Printf(
 			"[runAll] centralized logs: tee %s → Promtail (ai-monitor) → Loki %s → Grafana %s",
@@ -193,6 +196,7 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 		processes:                    make(map[string]*exec.Cmd),
 		monitors:                     make(map[string]context.CancelFunc),
 		logRepository:                logRepo,
+		fileLogSink:                    fileLogSink,
 		ownershipRepo:                ownershipRepo,
 		ownershipGuard:               domain.NewServiceOwnershipGuardService(ownershipRepo),
 		runtimePrereqProbeRepository: noopRuntimePrereqProbeRepository{},
@@ -755,10 +759,10 @@ func (r *Runner) restartService(ctx context.Context, name string) error {
 	r.stopMonitoring(name)
 
 	// Build before stopping: a failed build leaves the old process running.
-	if svc.BuildCommand != "" {
+	if buildCmd := resolveBuildCommand(*svc); buildCmd != "" {
 		r.store.Update(name, StatusBuilding, "")
 		log.Printf("[%s] building...", name)
-		if err := r.runBuild(ctx, svc); err != nil {
+		if err := r.runBuild(ctx, svc, buildCmd); err != nil {
 			r.store.Update(name, previousStatus, err.Error())
 			return err
 		}
@@ -1165,7 +1169,8 @@ func (r *Runner) BuildService(ctx context.Context, name string) error {
 	if svc == nil {
 		return fmt.Errorf("service %q not found", name)
 	}
-	if svc.BuildCommand == "" {
+	buildCmd := resolveBuildCommand(*svc)
+	if buildCmd == "" {
 		return fmt.Errorf("service %q has no build command configured", name)
 	}
 
@@ -1186,7 +1191,7 @@ func (r *Runner) BuildService(ctx context.Context, name string) error {
 
 	log.Printf("[%s] build-only requested", name)
 
-	if err := r.runBuild(ctx, svc); err != nil {
+	if err := r.runBuild(ctx, svc, buildCmd); err != nil {
 		r.store.Update(name, StatusFailed, err.Error())
 		return err
 	}
@@ -1204,6 +1209,29 @@ func (r *Runner) findService(name string) *Service {
 		}
 	}
 	return nil
+}
+
+func (r *Runner) configuredServiceNames() []string {
+	if r == nil || r.cfg == nil {
+		return nil
+	}
+	services := r.cfg.Flatten()
+	names := make([]string, 0, len(services))
+	for _, svc := range services {
+		if strings.TrimSpace(svc.Name) != "" {
+			names = append(names, svc.Name)
+		}
+	}
+	return names
+}
+
+func (r *Runner) ClearAllObservability(ctx context.Context, configPath string) domain.ObservabilityStackResetResult {
+	resetter := infrastructure.NewScriptObservabilityStorageResetter(
+		infrastructure.ResolveObservabilityResetScript(configPath),
+		"",
+	)
+	svc := domain.NewObservabilityStackResetService(r.logRepository, r.fileLogSink, resetter)
+	return svc.ClearAll(ctx, r.configuredServiceNames())
 }
 
 func (r *Runner) stopProcess(name string) bool {
@@ -1391,8 +1419,8 @@ func stopOrderForGroup(services []Service) ([]string, error) {
 	return stopOrder, nil
 }
 
-func (r *Runner) runBuild(ctx context.Context, svc *Service) error {
-	cmd := exec.CommandContext(ctx, "sh", "-c", svc.BuildCommand)
+func (r *Runner) runBuild(ctx context.Context, svc *Service, buildCommand string) error {
+	cmd := exec.CommandContext(ctx, "sh", "-c", buildCommand)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if svc.WorkingDir != "" {

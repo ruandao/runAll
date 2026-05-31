@@ -69,7 +69,7 @@ func TestRunBuild_Success(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestRunBuild_CommandFailed(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err == nil {
 		t.Fatal("expected error for failed build command")
 	}
@@ -104,7 +104,7 @@ func TestRunBuild_WithWorkingDir(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRunBuild_WithEnv(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRunBuild_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err == nil {
 		t.Fatal("expected error for canceled context")
 	}
@@ -165,7 +165,7 @@ func TestRunBuild_AppendsStructuredLogs(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := runner.runBuild(ctx, svc)
+	err := runner.runBuild(ctx, svc, svc.BuildCommand)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -225,6 +225,46 @@ func TestBuildService_Success(t *testing.T) {
 	}
 
 	status := store.Get("build-only-ok")
+	if status == nil || status.Status != StatusHealthy {
+		t.Fatalf("status = %#v, want healthy", status)
+	}
+}
+
+func TestBuildService_InferredFromRunScript(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	store := NewStatusStore()
+	runner, err := NewRunner(&Config{
+		Version: "1",
+		Groups: []Group{
+			{Name: "g1", Services: []Service{
+				{
+					Name:        "inferred-build",
+					Command:     "bash run.sh",
+					WorkingDir:  filepath.Join(repoRoot, "taskAuth"),
+					HealthCheck: HealthCheck{URL: "http://localhost:8003/api/health/"},
+				},
+			}},
+		},
+	}, store)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	inferred := resolveBuildCommand(Service{
+		Command:    "bash run.sh",
+		WorkingDir: filepath.Join(repoRoot, "taskAuth"),
+	})
+	if inferred == "" {
+		t.Fatal("expected inferred build command for taskAuth run.sh")
+	}
+
+	store.Update("inferred-build", StatusHealthy, "")
+	err = runner.BuildService(context.Background(), "inferred-build")
+	if err != nil {
+		t.Fatalf("BuildService inferred: %v", err)
+	}
+
+	status := store.Get("inferred-build")
 	if status == nil || status.Status != StatusHealthy {
 		t.Fatalf("status = %#v, want healthy", status)
 	}

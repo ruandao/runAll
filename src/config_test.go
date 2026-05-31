@@ -516,3 +516,35 @@ func TestProductionConfig_VueFrontendHasBuildCommand(t *testing.T) {
 		t.Fatalf("build_command = %q, want %q", vueFrontend.BuildCommand, "npm run build")
 	}
 }
+
+func TestProductionConfig_RootRunAllYaml_TaskEventsHaveBuildCommand(t *testing.T) {
+	path := filepath.Join("..", "..", "runAll.yaml")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig(%q): %v", path, err)
+	}
+
+	want := map[string]string{
+		"task-events-accounts":  "bash run.sh build accounts",
+		"task-events-projects":  "bash run.sh build projects",
+		"task-events-cloud":     "bash run.sh build cloud",
+		"task-events-realtime":  "bash run.sh build realtime",
+		"task-events-billing":   "bash run.sh build billing",
+	}
+	for name, wantCmd := range want {
+		var svc *Service
+		for _, s := range cfg.Flatten() {
+			if s.Name == name {
+				copy := s
+				svc = &copy
+				break
+			}
+		}
+		if svc == nil {
+			t.Fatalf("service %q not found in %s", name, path)
+		}
+		if svc.BuildCommand != wantCmd {
+			t.Fatalf("%s build_command = %q, want %q", name, svc.BuildCommand, wantCmd)
+		}
+	}
+}

@@ -70,6 +70,17 @@ func TestResolveBuildCommand_NotBuildable(t *testing.T) {
 	}
 }
 
+func TestResolveBuildCommand_SkipsShellVariableInRunScript(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	got := resolveBuildCommand(Service{
+		Command:    "bash run.sh start accounts",
+		WorkingDir: filepath.Join(repoRoot, "taskEvents"),
+	})
+	if got != "" {
+		t.Fatalf("resolveBuildCommand taskEvents without build_command = %q, want empty", got)
+	}
+}
+
 func TestServiceBuildable(t *testing.T) {
 	if !serviceBuildable(&Service{BuildCommand: "npm run build"}) {
 		t.Fatal("expected buildable service with explicit build_command")

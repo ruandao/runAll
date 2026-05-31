@@ -57,6 +57,10 @@ func extractGoBuildFromRunScript(workingDir string) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "go build") {
+			// Skip function-body templates (e.g. taskEvents run.sh with ${name}).
+			if strings.Contains(trimmed, "$") {
+				continue
+			}
 			return trimmed
 		}
 	}
