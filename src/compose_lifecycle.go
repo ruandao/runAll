@@ -14,6 +14,9 @@ func isDetachLaunchCommand(command string) bool {
 	if strings.Contains(lower, "run-infra.sh") {
 		return true
 	}
+	if strings.Contains(lower, "run.sh managed") || strings.Contains(lower, "run.sh start") {
+		return true
+	}
 	if !strings.Contains(lower, "compose") {
 		return false
 	}
@@ -31,8 +34,16 @@ func composeStopShellCommand(svc *Service) string {
 	if strings.Contains(lower, "run-infra.sh") {
 		return "bash run-infra.sh stop"
 	}
-	if svc.WorkingDir != "" && fileExists(filepath.Join(svc.WorkingDir, "run-infra.sh")) {
-		return "bash run-infra.sh stop"
+	if strings.Contains(lower, "run.sh") {
+		return "bash run.sh stop"
+	}
+	if svc.WorkingDir != "" {
+		if fileExists(filepath.Join(svc.WorkingDir, "run-infra.sh")) {
+			return "bash run-infra.sh stop"
+		}
+		if fileExists(filepath.Join(svc.WorkingDir, "run.sh")) {
+			return "bash run.sh stop"
+		}
 	}
 	return ""
 }

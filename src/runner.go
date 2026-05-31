@@ -143,8 +143,12 @@ func NewRunner(cfg *Config, store *StatusStore) (*Runner, error) {
 	// Populate command and URL in store for UI display
 	for _, svc := range services {
 		store.SetCommand(svc.Name, svc.Command)
-		store.SetURL(svc.Name, svc.HealthCheck.URL)
-		store.SetHealthPort(svc.Name, domain.ResolveHealthPort(svc.HealthCheck.URL))
+		store.SetURL(svc.Name, svc.HealthCheck.DisplayEndpoint())
+		healthPort := domain.ResolveHealthPort(svc.HealthCheck.URL)
+		if healthPort == "" {
+			healthPort = domain.ResolveTCPPort(svc.HealthCheck.TCP)
+		}
+		store.SetHealthPort(svc.Name, healthPort)
 		store.SetCommandPort(svc.Name, domain.ResolveCommandPort(svc.Command))
 	}
 	for _, group := range cfg.Groups {
@@ -470,7 +474,7 @@ func (r *Runner) startAndCheck(ctx context.Context, node *ServiceNode) error {
 	r.probeReadiness(ctx, svc)
 	r.store.UpdateDependencyStatus(svc.Name, StatusHealthy)
 	r.establishServiceOwnership(svc, cmd.Process.Pid, actorSessionIDFromContext(ctx))
-	log.Printf("[%s] healthy (%s)", svc.Name, svc.HealthCheck.StartupProbeURL())
+	log.Printf("[%s] healthy (%s)", svc.Name, svc.HealthCheck.DisplayEndpoint())
 	return nil
 }
 
@@ -519,7 +523,7 @@ func (r *Runner) establishServiceOwnership(svc Service, pid int, actorSessionID 
 		owner,
 		pid,
 		defaultOwnershipConfigRef,
-		svc.HealthCheck.URL,
+		svc.HealthCheck.DisplayEndpoint(),
 		time.Now(),
 	)
 	if err != nil {
@@ -555,7 +559,7 @@ func waitHealthyWithLaunchCheck(ctx context.Context, process *os.Process, cfg He
 			return fmt.Errorf("health check timed out after %ds", cfg.Timeout)
 		}
 
-		err := checkHealth(ctx, cfg.URL)
+		err := checkProbe(ctx, cfg)
 		if err == nil {
 			return nil
 		}
@@ -684,7 +688,7 @@ func (r *Runner) TakeoverService(name string, actorSessionID string) error {
 		actor,
 		pid,
 		"takeover",
-		svc.HealthCheck.URL,
+		svc.HealthCheck.DisplayEndpoint(),
 		time.Now(),
 	)
 	if err != nil {
@@ -1269,25 +1273,25 @@ func (r *Runner) ensureServiceNotReachable(svc *Service) error {
 	if svc == nil {
 		return fmt.Errorf("service is required")
 	}
-	if checkHealth(context.Background(), svc.HealthCheck.URL) != nil {
+	if checkProbe(context.Background(), svc.HealthCheck) != nil {
 		return nil
 	}
 
 	ports := resolveServicePorts(svc)
 	if len(ports) == 0 {
-		return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.URL)
+		return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.DisplayEndpoint())
 	}
 
 	for _, port := range ports {
 		if err := terminateListenersByPort(port); err != nil {
 			log.Printf("[%s] stop fallback on port %s failed: %v", svc.Name, port, err)
 		}
-		if checkHealth(context.Background(), svc.HealthCheck.URL) != nil {
+		if checkProbe(context.Background(), svc.HealthCheck) != nil {
 			return nil
 		}
 	}
 
-	return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.URL)
+	return fmt.Errorf("service %q still reachable at %s after stop", svc.Name, svc.HealthCheck.DisplayEndpoint())
 }
 
 func resolveServicePorts(svc *Service) []string {
@@ -1296,6 +1300,7 @@ func resolveServicePorts(svc *Service) []string {
 
 	for _, candidate := range []string{
 		domain.ResolveHealthPort(svc.HealthCheck.URL),
+		domain.ResolveTCPPort(svc.HealthCheck.TCP),
 		domain.ResolveCommandPort(svc.Command),
 	} {
 		candidate = strings.TrimSpace(candidate)
@@ -1529,7 +1534,10 @@ func (r *Runner) reconcileFailedServiceHealth(ctx context.Context) {
 		if st == nil || st.Status != StatusFailed {
 			continue
 		}
-		if strings.TrimSpace(svc.HealthCheck.URL) == "" {
+		if !svc.HealthCheck.UsesTCP() && strings.TrimSpace(svc.HealthCheck.URL) == "" {
+			continue
+		}
+		if svc.HealthCheck.UsesTCP() && strings.TrimSpace(svc.HealthCheck.TCP) == "" {
 			continue
 		}
 		now := time.Now()
@@ -1545,7 +1553,7 @@ func (r *Runner) reconcileFailedServiceHealth(ctx context.Context) {
 			r.startMonitoring(context.Background(), svc)
 			continue
 		}
-		if err := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL()); err != nil {
+		if err := checkProbe(ctx, svc.HealthCheck); err != nil {
 			r.store.SetLastChecked(svc.Name, now)
 			continue
 		}
@@ -1606,7 +1614,7 @@ func (r *Runner) runMonitor(ctx context.Context, svc Service, interval time.Dura
 				continue
 			}
 
-			err := checkHealth(ctx, svc.HealthCheck.ReadinessProbeURL())
+			err := checkProbe(ctx, svc.HealthCheck)
 			if err != nil {
 				consecutive++
 				log.Printf("[%s] health check failed (%d/%d): %v", svc.Name, consecutive, threshold, err)

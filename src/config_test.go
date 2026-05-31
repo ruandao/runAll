@@ -392,9 +392,62 @@ groups:
 
 	_, err := LoadConfig(path)
 	if err == nil {
-		t.Fatal("expected error for missing health_check.url")
+		t.Fatal("expected error for missing health_check probe")
 	}
 	if !strings.Contains(err.Error(), "health_check") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadConfig_TCPHealthCheck(t *testing.T) {
+	yaml := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: docker-redis
+        command: "bash run.sh managed"
+        health_check:
+          tcp: "127.0.0.1:6379"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	svc := cfg.Groups[0].Services[0]
+	if !svc.HealthCheck.UsesTCP() {
+		t.Fatal("expected TCP health check")
+	}
+	if svc.HealthCheck.DisplayEndpoint() != "tcp://127.0.0.1:6379" {
+		t.Fatalf("DisplayEndpoint = %q", svc.HealthCheck.DisplayEndpoint())
+	}
+}
+
+func TestLoadConfig_RejectsDualHealthProbes(t *testing.T) {
+	yaml := `
+version: "1"
+groups:
+  - name: g1
+    services:
+      - name: svc
+        command: "echo hi"
+        health_check:
+          url: "http://127.0.0.1:1"
+          tcp: "127.0.0.1:6379"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("expected error for dual probes")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -48,12 +48,26 @@ type Service struct {
 
 type HealthCheck struct {
 	URL                string  `yaml:"url"`
+	TCP                string  `yaml:"tcp"`          // optional; TCP dial probe (host:port)
 	LivenessURL        string  `yaml:"liveness_url"` // optional; startup probe only (readiness uses url)
 	Timeout            int     `yaml:"timeout"`
 	Retries            int     `yaml:"retries"`
 	CheckInterval      int     `yaml:"check_interval"`      // seconds between continuous health pings
 	UnhealthyThreshold int     `yaml:"unhealthy_threshold"` // consecutive failures before marking unhealthy
 	Backoff            Backoff `yaml:"backoff"`
+}
+
+// UsesTCP reports whether readiness is checked via TCP dial instead of HTTP.
+func (hc HealthCheck) UsesTCP() bool {
+	return strings.TrimSpace(hc.TCP) != ""
+}
+
+// DisplayEndpoint returns a UI-friendly probe target.
+func (hc HealthCheck) DisplayEndpoint() string {
+	if hc.UsesTCP() {
+		return "tcp://" + strings.TrimSpace(hc.TCP)
+	}
+	return hc.URL
 }
 
 // StartupProbeURL returns the HTTP URL used while waiting for a service to become ready.
@@ -200,8 +214,13 @@ func (c *Config) validate() error {
 			if svc.Command == "" {
 				return fmt.Errorf("service %q: command is required", svc.Name)
 			}
-			if svc.HealthCheck.URL == "" {
-				return fmt.Errorf("service %q: health_check.url is required", svc.Name)
+			url := strings.TrimSpace(svc.HealthCheck.URL)
+			tcp := strings.TrimSpace(svc.HealthCheck.TCP)
+			if url == "" && tcp == "" {
+				return fmt.Errorf("service %q: health_check.url or health_check.tcp is required", svc.Name)
+			}
+			if url != "" && tcp != "" {
+				return fmt.Errorf("service %q: health_check.url and health_check.tcp are mutually exclusive", svc.Name)
 			}
 			if svc.OnFailure != "exit" && svc.OnFailure != "skip" {
 				return fmt.Errorf("service %q: on_failure must be 'exit' or 'skip', got %q", svc.Name, svc.OnFailure)

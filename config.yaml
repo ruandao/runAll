@@ -15,11 +15,23 @@ observability:
 groups:
   - name: infrastructure
     services:
-      # Redis + Kafka + Kafka UI（Saas_project/docker-compose.yml）
-      # 健康检查走 Kafka UI 的 HTTP；Redis/Kafka broker 无 HTTP 探针
-      - name: docker-infra
-        command: "bash run-infra.sh managed"
-        working_dir: ../task2app/Saas_project
+      # Redis 与 Kafka 拆分为独立栈（dockerInfra/）
+      - name: docker-redis
+        command: "bash run.sh managed"
+        working_dir: dockerInfra/redis
+        health_check:
+          tcp: "127.0.0.1:6379"
+          timeout: 60
+          retries: 20
+          backoff:
+            initial: 1.0
+            max: 8.0
+            multiplier: 2.0
+        on_failure: skip
+
+      - name: docker-kafka
+        command: "bash run.sh managed"
+        working_dir: dockerInfra/kafka
         health_check:
           url: "http://127.0.0.1:18080"
           timeout: 180
@@ -56,7 +68,7 @@ groups:
         working_dir: ../task2app
         env:
           DISABLE_MANAGEPY_VUE_AUTOSTART: "1"
-        depends_on: [task-auth, git-oauth, docker-infra, task-sse]
+        depends_on: [task-auth, git-oauth, docker-redis, task-sse]
         health_check:
           liveness_url: "http://127.0.0.1:8001/api/live/"
           url: "http://127.0.0.1:8001/api/health/"
@@ -71,7 +83,7 @@ groups:
       - name: task-sse
         command: "bash run.sh"
         working_dir: ../taskSSE
-        depends_on: [docker-infra]
+        depends_on: [docker-redis]
         health_check:
           url: "http://127.0.0.1:8798/health"
           timeout: 60

@@ -15,6 +15,7 @@ func TestIsDetachLaunchCommand(t *testing.T) {
 		want    bool
 	}{
 		{command: "bash run-infra.sh managed", want: true},
+		{command: "bash run.sh managed", want: true},
 		{command: "docker compose -f docker-compose.yml up -d", want: true},
 		{command: "docker-compose up -d", want: true},
 		{command: "sleep 30", want: false},
@@ -27,9 +28,16 @@ func TestIsDetachLaunchCommand(t *testing.T) {
 	}
 }
 
-func TestComposeStopShellCommand(t *testing.T) {
+func TestComposeStopShellCommand_LegacyInfra(t *testing.T) {
 	svc := &Service{Command: "bash run-infra.sh managed", WorkingDir: "task2app/Saas_project"}
 	if got := composeStopShellCommand(svc); got != "bash run-infra.sh stop" {
+		t.Fatalf("composeStopShellCommand() = %q", got)
+	}
+}
+
+func TestComposeStopShellCommand_DockerInfraRedis(t *testing.T) {
+	svc := &Service{Command: "bash run.sh managed", WorkingDir: "runAll/dockerInfra/redis"}
+	if got := composeStopShellCommand(svc); got != "bash run.sh stop" {
 		t.Fatalf("composeStopShellCommand() = %q", got)
 	}
 }

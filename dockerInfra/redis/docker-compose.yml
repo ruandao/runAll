@@ -1,0 +1,11 @@
+services:
+  redis:
+    image: redis:7.0-alpine
+    pull_policy: if_not_present
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

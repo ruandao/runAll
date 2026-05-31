@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -28,22 +30,10 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 			return fmt.Errorf("health check timed out after %ds", cfg.Timeout)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.URL, nil)
-		if err != nil {
-			return fmt.Errorf("create request: %w", err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			resp.Body.Close()
+		if err := checkProbe(ctx, cfg); err == nil {
 			return nil
-		}
-		if err != nil {
+		} else {
 			lastCheckErr = err
-		} else if resp != nil {
-			lastCheckErr = fmt.Errorf("unhealthy: HTTP %d", resp.StatusCode)
-		}
-		if resp != nil {
-			resp.Body.Close()
 		}
 
 		interval = time.Duration(float64(interval) * cfg.Backoff.Multiplier)
@@ -53,6 +43,22 @@ func waitHealthy(ctx context.Context, cfg HealthCheck) error {
 	}
 
 	return fmt.Errorf("health check failed after %d retries", cfg.Retries)
+}
+
+func checkProbe(ctx context.Context, hc HealthCheck) error {
+	if hc.UsesTCP() {
+		return checkTCP(ctx, strings.TrimSpace(hc.TCP))
+	}
+	return checkHealth(ctx, hc.URL)
+}
+
+func checkTCP(ctx context.Context, addr string) error {
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func checkHealth(ctx context.Context, url string) error {

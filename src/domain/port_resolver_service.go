@@ -30,6 +30,10 @@ func ResolveHealthPort(rawURL string) string {
 	}
 }
 
+func ResolveTCPPort(addr string) string {
+	return extractPortFromHostAddr(strings.TrimSpace(addr))
+}
+
 func ResolveCommandPort(command string) string {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
